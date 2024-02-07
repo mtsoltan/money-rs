@@ -2,7 +2,7 @@ create type entry_t as enum ('spend', 'income', 'lend', 'borrow', 'convert');
 
 create table users (
     id serial primary key,
-    username varchar(1023) not null,
+    username varchar(1023) unique not null,
     password varchar(1023) not null,
     fixed_currency_id int4
 );
@@ -11,7 +11,8 @@ create table currencies (
     id serial primary key,
     user_id int4 not null references users(id) on delete cascade,
     name varchar(1023) not null,
-    rate_to_fixed float8 not null
+    rate_to_fixed float8 not null,
+    constraint user_currency unique (user_id, name)
 );
 
 alter table users add constraint fixed_currency_id_fk
@@ -20,7 +21,8 @@ alter table users add constraint fixed_currency_id_fk
 create table categories (
     id serial primary key,
     user_id int4 not null references users(id) on delete cascade,
-    name varchar(1023) not null
+    name varchar(1023) not null,
+    constraint user_category unique (user_id, name)
 );
 
 create table sources (
@@ -28,7 +30,8 @@ create table sources (
     user_id int4 not null references users(id) on delete cascade,
     name varchar(1023) not null,
     currency_id int4 not null references currencies(id) on delete restrict,
-    amount float8 not null
+    amount float8 not null,
+    constraint user_source unique (user_id, name)
 );
 
 create table entries (
@@ -38,6 +41,7 @@ create table entries (
     category_id int4 not null references categories(id) on delete restrict,
     amount float8 not null,
     date timestamp not null,
+    created_at timestamp not null default now(),
     currency_id int4 not null references currencies(id) on delete restrict,
     entry_type entry_t not null,
     source_id int4 not null references sources(id) on delete restrict,

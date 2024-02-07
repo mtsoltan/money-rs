@@ -36,6 +36,7 @@ diesel::table! {
         category_id -> Int4,
         amount -> Float8,
         date -> Timestamp,
+        created_at -> Timestamp,
         currency_id -> Int4,
         entry_type -> EntryT,
         source_id -> Int4,
