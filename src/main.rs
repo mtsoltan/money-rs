@@ -29,7 +29,7 @@ async fn main() -> std::io::Result<()> {
     let manager = ConnectionManager::<PgConnection>::new(env_vars::database_url());
     let pool = Pool::builder()
         .build(manager)
-        .expect("Failed to create pool");
+        .expect("Failmed to create pool");
     HttpServer::new(move || app(&pool))
         .bind(env_vars::bind_address())?
         .run()
@@ -56,16 +56,33 @@ fn app(
                     authentication::jwt_validator_generator,
                 ))
                 .service(
-                    web::scope("/currency").route("", web::post().to(handlers::create_currency)),
+                    web::scope("/currency")
+                        .route("", web::post().to(handlers::create_currency))
+                        .route("", web::get().to(handlers::get_currencies))
+                        .route("/{name}", web::get().to(handlers::get_currency_by_name)),
                 )
-                .service(web::scope("/source").route("", web::post().to(handlers::create_source)))
                 .service(
-                    web::scope("/category").route("", web::post().to(handlers::create_category)),
+                    web::scope("/source")
+                        .route("", web::post().to(handlers::create_source))
+                        .route("", web::get().to(handlers::get_sources))
+                        .route("/{name}", web::get().to(handlers::get_source_by_name)),
+                )
+                .service(
+                    web::scope("/category")
+                        .route("", web::post().to(handlers::create_category))
+                        .route("", web::get().to(handlers::get_categories))
+                        .route("/{name}", web::get().to(handlers::get_category_by_name)),
+                )
+                .service(
+                    web::scope("/entry")
+                        .route("", web::post().to(handlers::create_entry))
+                        .route("", web::get().to(handlers::get_entries))
+                        .route("/delete", web::delete().to(handlers::delete_entries)),
                 ),
         );
 
     #[cfg(feature = "create_user")]
-    let app = app.route("/api/user", web::post().to(handlers::create_user));
+    let app = app.route("/register", web::post().to(handlers::create_user));
 
     app
 }

@@ -14,6 +14,7 @@ use crate::{
 
 #[derive(Serialize)]
 pub struct CreateResponse {
+    #[serde(skip_serializing)]
     id: i32,
 }
 
@@ -144,7 +145,7 @@ pub async fn create_user(
     }
 }
 
-macro_rules! create {
+macro_rules! create_handler {
     ($fn_name:ident, $tb_name:ident, $req:ty, $new:ident, $ent:ty) => {
         pub async fn $fn_name(
             _req: HttpRequest,
@@ -152,10 +153,22 @@ macro_rules! create {
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
-            dbg!(&data);
             use crate::schema::$tb_name::dsl::*;
+            use crate::model::{TryFromRequest, TryFromRequestError};
+            let creatable = <$new as TryFromRequest<$req>>::try_from_request(
+                    data.into_inner(),
+                    user.into_inner(),
+                    app_state.clone().into_inner(),
+                );
+            let creatable = match creatable {
+                Err(e) => return match e {
+                    TryFromRequestError::ReferencedDoesNotExist(_) => HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
+                    TryFromRequestError::DateTimeParseError(_) => HttpResponse::BadRequest().body("Malformed date provided"),
+                },
+                Ok(c) => c
+            };
             let created = insert_into($tb_name)
-                .values($new::from_request(data.into_inner(), user.into_inner()))
+                .values(creatable)
                 .get_result::<$ent>(&mut app_state.cpool());
             match created {
                 Ok(c) => HttpResponse::Ok().json(CreateResponse { id: c.id }),
@@ -165,18 +178,106 @@ macro_rules! create {
     };
 }
 
-create!(
+create_handler!(
     create_currency,
     currencies,
     CurrencyRequest,
     NewCurrency,
     Currency
 );
-create!(create_source, sources, SourceRequest, NewSource, Source);
-create!(
+create_handler!(create_source, sources, SourceRequest, NewSource, Source);
+create_handler!(
     create_category,
     categories,
     CategoryRequest,
     NewCategory,
     Category
 );
+create_handler!(create_entry, entries, EntryRequest, NewEntry, Entry);
+
+macro_rules! get_all_handler {
+    ($fn_name:ident, $ent:ident) => {
+        pub async fn $fn_name(
+            _req: HttpRequest,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            let fetched = $ent::belonging_to(&user.into_inner())
+                .select($ent::as_select())
+                .load(&mut app_state.cpool());
+            match fetched {
+                Ok(f) => HttpResponse::Ok().json(f),
+                Err(_) => HttpResponse::InternalServerError().body("E003"),
+            }
+        }
+    };
+}
+
+get_all_handler!(get_currencies, Currency);
+get_all_handler!(get_sources, Source);
+get_all_handler!(get_categories, Category);
+get_all_handler!(get_entries, Entry);
+
+macro_rules! get_by_name_handler {
+    ($fn_name:ident, $tb_name:ident, $ent:ident) => {
+        pub async fn $fn_name(
+            path_name: web::Path<String>,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            use crate::schema::$tb_name::dsl::*;
+            let fetched = $ent::belonging_to(&user.into_inner())
+                .filter(name.eq(&path_name.into_inner()))
+                .select($ent::as_select())
+                .first(&mut app_state.cpool());
+            match fetched {
+                Ok(entity) => HttpResponse::Ok().json(entity),
+                Err(_) => HttpResponse::NotFound().body("Entity not found"),
+            }
+        }
+    };
+}
+
+get_by_name_handler!(get_currency_by_name, currencies, Currency);
+get_by_name_handler!(get_source_by_name, sources, Source);
+get_by_name_handler!(get_category_by_name, categories, Category);
+
+// TODO: Add support for archival of currencies, sources, categories with balance of 0.
+//  Error message on attempted archival of non-zero currency:
+//  You cannot archive that currency while you still have balance within it. The balance exists in the following sources: <_>
+//  Error message on attempted archival of non-zero source:
+//  You cannot archive that source while it still has balance. You can transfer all balance to another source of the same currency
+//  or do a currency conversion to a different source of a different currency.
+//  Error message on attempted archival of non-zero category:
+//  You cannot archive that category while it has entries. You can transfer all entries to another category and then proceed.
+
+/*
+Front end should allow:
+
+# Entries functionality
+- Listing of entries
+- Filtering of entries based on source (including secondary source) / category / currency / entry type
+- Filtering of entries based on amount (gte / lte / eq)
+- Filtering of entries based on date (gte / lte / eq) (can quick select a month or a year)
+- Search of entries based on description
+- Multi-selecting entries, with select all that selects all entries in the search / filter.
+- Sort based on any field
+- Displays sum of selected entries (all entries if none selected)
+- Displays average per month of selected entries
+- Displays sum per category per month of selected entries
+- Bulk editing of selected entries (can change category / description / currency / source / secondary source / entry type)
+- Editing of individual entries (allows changing the above, and conversion rate, date and amount)
+- Archival / deletion of entries
+- Creation of new entries
+
+# Categories functionality
+- Monthly sum of entries for this category
+- TODO
+
+# Currencies functionality
+- Change display currency (for all of the above) - defaults to the fixed currency of the user
+- TODO
+
+# Sources functionality
+- TODO
+*/
