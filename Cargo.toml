@@ -1,0 +1,33 @@
+workspace = { members = ["inner_macros"] }
+
+[package]
+name = "money-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+diesel = { version = "2.1.4", features = ["postgres", "r2d2", "chrono"] }
+diesel-derive-enum = { version = "2.1.0", features = ["postgres"] }
+dotenv = "0.15"
+chrono = { version = "0.4.31", features = ["serde"] }
+jsonwebtoken = "9.2.0"
+serde = { version = "1.0.195", features = ["derive"] }
+r2d2 = "0.8.10"
+reqwest = "0.11.23"
+password-hash = "0.5.0"
+pbkdf2 = { version = "0.12.2", features = ["simple"] }
+rust-crypto = "0.2.36"
+
+actix-web = "4.4.1"
+#actix-http = "3.5.1"
+#time = "0.3.31"
+actix-web-httpauth = "0.8.1"
+rand = "0.8.5"
+base64 = "0.21.7"
+inner-macros = { path = "./inner_macros" }
+
+[features]
+default = []
+create_user = []
