@@ -126,9 +126,9 @@ get_impls!(Category, categories);
 get_impls!(Source, sources);
 
 pub trait StatefulTryFrom<S> {
-    fn try_from_request(
+    fn stateful_try_from(
         value: S,
-        user: User,
+        user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError>
     where
@@ -172,13 +172,41 @@ pub struct Currency {
 }
 
 impl StatefulTryFrom<CreateCurrencyRequest> for NewCurrency {
-    fn try_from_request(
+    fn stateful_try_from(
         value: CreateCurrencyRequest,
-        user: User,
+        user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
         Ok(Self {
             user_id: user.id,
+            name: value.name,
+            rate_to_fixed: value.rate_to_fixed,
+            archived: value.archived,
+        })
+    }
+}
+
+impl StatefulTryFrom<UpdateCurrencyRequest> for UpdateCurrency {
+    fn stateful_try_from(
+        value: UpdateCurrencyRequest,
+        _user: &User,
+        _app_state: Arc<AppState>,
+    ) -> Result<Self, StatefulTryFromError> {
+        Ok(Self {
+            name: value.name,
+            rate_to_fixed: value.rate_to_fixed,
+            archived: value.archived,
+        })
+    }
+}
+
+impl StatefulTryFrom<Currency> for CurrencyResponse {
+    fn stateful_try_from(
+        value: Currency,
+        _user: &User,
+        _app_state: Arc<AppState>,
+    ) -> Result<Self, StatefulTryFromError> {
+        Ok(Self {
             name: value.name,
             rate_to_fixed: value.rate_to_fixed,
             archived: value.archived,
@@ -207,21 +235,54 @@ pub struct Source {
 }
 
 impl StatefulTryFrom<CreateSourceRequest> for NewSource {
-    fn try_from_request(
+    fn stateful_try_from(
         value: CreateSourceRequest,
-        user: User,
+        user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        use crate::schema::currencies::dsl::*;
-        let currency_id: i32 = currencies
-            .filter(name.eq(value.currency).and(user_id.eq(user.id)))
-            .select(id)
-            .first(&mut app_state.cpool())?;
         Ok(Self {
             user_id: user.id,
             name: value.name,
-            currency_id,
+            currency_id: Currency::get_id_by_name_and_user(
+                value.currency,
+                &user,
+                app_state.clone(),
+            )?,
             amount: 0.0f64,
+            archived: value.archived,
+        })
+    }
+}
+
+impl StatefulTryFrom<UpdateSourceRequest> for UpdateSource {
+    fn stateful_try_from(
+        value: UpdateSourceRequest,
+        user: &User,
+        app_state: Arc<AppState>,
+    ) -> Result<Self, StatefulTryFromError> {
+        Ok(Self {
+            name: value.name,
+            currency_id: Currency::get_id_by_name_and_user(
+                value.currency,
+                &user,
+                app_state.clone(),
+            )?,
+            amount: value.amount,
+            archived: value.archived,
+        })
+    }
+}
+
+impl StatefulTryFrom<Source> for SourceResponse {
+    fn stateful_try_from(
+        value: Source,
+        _user: &User,
+        app_state: Arc<AppState>,
+    ) -> Result<Self, StatefulTryFromError> {
+        Ok(Self {
+            name: value.name,
+            currency: Currency::get_name_by_id(value.currency_id, app_state.clone())?,
+            amount: value.amount,
             archived: value.archived,
         })
     }
@@ -244,13 +305,39 @@ pub struct Category {
 }
 
 impl StatefulTryFrom<CreateCategoryRequest> for NewCategory {
-    fn try_from_request(
+    fn stateful_try_from(
         value: CreateCategoryRequest,
-        user: User,
+        user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
         Ok(Self {
             user_id: user.id,
+            name: value.name,
+            archived: value.archived,
+        })
+    }
+}
+
+impl StatefulTryFrom<UpdateCategoryRequest> for UpdateCategory {
+    fn stateful_try_from(
+        value: UpdateCategoryRequest,
+        _user: &User,
+        _app_state: Arc<AppState>,
+    ) -> Result<Self, StatefulTryFromError> {
+        Ok(Self {
+            name: value.name,
+            archived: value.archived,
+        })
+    }
+}
+
+impl StatefulTryFrom<Category> for CategoryResponse {
+    fn stateful_try_from(
+        value: Category,
+        _user: &User,
+        _app_state: Arc<AppState>,
+    ) -> Result<Self, StatefulTryFromError> {
+        Ok(Self {
             name: value.name,
             archived: value.archived,
         })
@@ -292,9 +379,9 @@ pub struct Entry {
 }
 
 impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
-    fn try_from_request(
+    fn stateful_try_from(
         value: CreateEntryRequest,
-        user: User,
+        user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
         let new_secondary_source_id =
@@ -331,9 +418,9 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
 }
 
 impl StatefulTryFrom<UpdateEntryRequest> for UpdateEntry {
-    fn try_from_request(
+    fn stateful_try_from(
         value: UpdateEntryRequest,
-        user: User,
+        user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
         let new_secondary_source_id =
@@ -371,9 +458,9 @@ impl StatefulTryFrom<UpdateEntryRequest> for UpdateEntry {
 }
 
 impl StatefulTryFrom<Entry> for EntryResponse {
-    fn try_from_request(
+    fn stateful_try_from(
         value: Entry,
-        user: User,
+        _user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
         Ok(Self {

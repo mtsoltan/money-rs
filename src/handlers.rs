@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{
-        Category, CreateCategoryRequest, CreateCurrencyRequest, CreateEntryRequest,
-        CreateSourceRequest, Currency, Entry, NewCategory, NewCurrency, NewEntry, NewSource,
-        Source, User,
+        Category, CategoryResponse, CreateCategoryRequest, CreateCurrencyRequest,
+        CreateEntryRequest, CreateSourceRequest, Currency, CurrencyResponse, Entry, EntryResponse,
+        NewCategory, NewCurrency, NewEntry, NewSource, Source, SourceResponse, StatefulTryFrom,
+        StatefulTryFromError, User,
     },
     AppState,
 };
@@ -166,18 +167,19 @@ macro_rules! create_handler {
             user: web::ReqData<User>,
         ) -> HttpResponse {
             use crate::schema::$tb_name::dsl::*;
-            use crate::model::{StatefulTryFrom, StatefulTryFromError};
-            let creatable = <$new as StatefulTryFrom<$req>>::try_from_request(
+            let creatable = <$new as StatefulTryFrom<$req>>::stateful_try_from(
                     data.into_inner(),
-                    user.into_inner(),
+                    &user.into_inner(),
                     app_state.clone().into_inner(),
                 );
             let creatable = match creatable {
                 Err(e) => return match e {
-                    StatefulTryFromError::ReferencedDoesNotExist(_) => HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
-                    StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
+                    StatefulTryFromError::ReferencedDoesNotExist(_) =>
+                        HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
+                    StatefulTryFromError::DateTimeParseError(_) =>
+                        HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
                 },
-                Ok(c) => c
+                Ok(c) => c,
             };
             let created = insert_into($tb_name)
                 .values(creatable)
@@ -214,51 +216,75 @@ create_handler!(
 create_handler!(create_entry, entries, CreateEntryRequest, NewEntry, Entry);
 
 macro_rules! get_all_handler {
-    ($fn_name:ident, $ent:ident) => {
+    ($fn_name:ident, $ent:ident, $resp:ident) => {
         pub async fn $fn_name(
             _req: HttpRequest,
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
-            let fetched = $ent::belonging_to(&user.into_inner())
+            let user = user.into_inner();
+            let app_state = app_state.into_inner();
+            let fetched = match $ent::belonging_to(&user)
                 .select($ent::as_select())
-                .load(&mut app_state.cpool());
-            match fetched {
-                Ok(f) => HttpResponse::Ok().json(f),
-                Err(_) => HttpResponse::InternalServerError().body("E003"),
+                .load(&mut app_state.cpool()) {
+                    Err(_) => return HttpResponse::InternalServerError().body("E003"),
+                    Ok(f) => f,
+                };
+            let responses = fetched.into_iter()
+                .map(|f| $resp::stateful_try_from(f, &user, app_state.clone()))
+                .collect::<Result<Vec<$resp>, _>>();
+
+            match responses {
+                Err(e) => return match e {
+                    StatefulTryFromError::ReferencedDoesNotExist(_) =>
+                        HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
+                    StatefulTryFromError::DateTimeParseError(_) =>
+                        HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
+                },
+                Ok(c) => HttpResponse::Ok().json(c),
             }
         }
     };
 }
 
-get_all_handler!(get_currencies, Currency);
-get_all_handler!(get_sources, Source);
-get_all_handler!(get_categories, Category);
-get_all_handler!(get_entries, Entry);
+get_all_handler!(get_currencies, Currency, CurrencyResponse);
+get_all_handler!(get_sources, Source, SourceResponse);
+get_all_handler!(get_categories, Category, CategoryResponse);
+get_all_handler!(get_entries, Entry, EntryResponse);
 
 macro_rules! get_by_name_handler {
-    ($fn_name:ident, $tb_name:ident, $ent:ident) => {
+    ($fn_name:ident, $tb_name:ident, $ent:ident, $resp:ident) => {
         pub async fn $fn_name(
             path_name: web::Path<String>,
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
             use crate::schema::$tb_name::dsl::*;
-            let fetched = $ent::belonging_to(&user.into_inner())
-                .filter(name.eq(&path_name.into_inner()))
+            let user = user.into_inner();
+            let app_state = app_state.into_inner();
+            let path_name = path_name.into_inner();
+            let fetched = match $ent::belonging_to(&user)
+                .filter(name.eq(&path_name))
                 .select($ent::as_select())
-                .first(&mut app_state.cpool());
-            match fetched {
+                .first(&mut app_state.cpool()) {
+                    Ok(f) => f,
+                    Err(_) => return HttpResponse::NotFound().body("Entity not found"),
+                };
+            let response = $resp::stateful_try_from(fetched, &user, app_state.clone());
+            match response {
+                Err(e) => return match e {
+                    StatefulTryFromError::ReferencedDoesNotExist(_) => HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
+                    StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
+                },
                 Ok(entity) => HttpResponse::Ok().json(entity),
-                Err(_) => HttpResponse::NotFound().body("Entity not found"),
             }
         }
     };
 }
 
-get_by_name_handler!(get_currency_by_name, currencies, Currency);
-get_by_name_handler!(get_source_by_name, sources, Source);
-get_by_name_handler!(get_category_by_name, categories, Category);
+get_by_name_handler!(get_currency_by_name, currencies, Currency, CurrencyResponse);
+get_by_name_handler!(get_source_by_name, sources, Source, SourceResponse);
+get_by_name_handler!(get_category_by_name, categories, Category, CategoryResponse);
 
 pub async fn delete_entries(
     web::Query(ids): web::Query<Vec<i32>>,
@@ -276,6 +302,8 @@ pub async fn delete_entries(
     }
 }
 
+// TODO: Build update handlers
+
 // TODO: Add support for archival of currencies, sources, categories with balance of 0.
 //  Error message on attempted archival of non-zero currency:
 //  You cannot archive that currency while you still have balance within it. The balance exists in the following sources: <_>
@@ -285,7 +313,7 @@ pub async fn delete_entries(
 //  Error message on attempted archival of non-zero category:
 //  You cannot archive that category while it has entries. You can transfer all entries to another category and then proceed.
 
-// TODO: Handlers of type GET should use responses and not entities themselves
+// TODO: Work on BE of filtering, searching, bulk editing, and displaying required for FE
 
 /*
 Front end should allow:
