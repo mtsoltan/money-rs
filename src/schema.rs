@@ -12,6 +12,7 @@ diesel::table! {
         user_id -> Int4,
         #[max_length = 1023]
         name -> Varchar,
+        archived -> Bool,
     }
 }
 
@@ -22,6 +23,7 @@ diesel::table! {
         #[max_length = 1023]
         name -> Varchar,
         rate_to_fixed -> Float8,
+        archived -> Bool,
     }
 }
 
@@ -41,8 +43,9 @@ diesel::table! {
         entry_type -> EntryT,
         source_id -> Int4,
         secondary_source_id -> Nullable<Int4>,
-        conversion_rate -> Float8,
+        conversion_rate -> Nullable<Float8>,
         conversion_rate_to_fixed -> Float8,
+        archived -> Bool,
     }
 }
 
@@ -54,6 +57,7 @@ diesel::table! {
         name -> Varchar,
         currency_id -> Int4,
         amount -> Float8,
+        archived -> Bool,
     }
 }
 
@@ -65,6 +69,7 @@ diesel::table! {
         #[max_length = 1023]
         password -> Varchar,
         fixed_currency_id -> Nullable<Int4>,
+        enabled -> Bool,
     }
 }
 

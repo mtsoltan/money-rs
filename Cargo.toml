@@ -1,3 +1,5 @@
+workspace = { members = ["inner_macros"] }
+
 [package]
 name = "money-rs"
 version = "0.1.0"
@@ -24,6 +26,7 @@ actix-web = "4.4.1"
 actix-web-httpauth = "0.8.1"
 rand = "0.8.5"
 base64 = "0.21.7"
+inner-macros = { path = "./inner_macros" }
 
 [features]
 default = []

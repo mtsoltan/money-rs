@@ -1,4 +1,5 @@
 #![feature(try_blocks)]
+#![feature(let_chains)]
 
 mod authentication;
 mod env_vars;
@@ -77,7 +78,7 @@ fn app(
                     web::scope("/entry")
                         .route("", web::post().to(handlers::create_entry))
                         .route("", web::get().to(handlers::get_entries))
-                        .route("/delete", web::delete().to(handlers::delete_entries)),
+                        .route("", web::delete().to(handlers::delete_entries)),
                 ),
         );
 

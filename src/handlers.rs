@@ -6,16 +6,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{
-        Category, CategoryRequest, Currency, CurrencyRequest, Entry, EntryRequest, NewCategory,
-        NewCurrency, NewEntry, NewSource, Source, SourceRequest, User,
+        Category, CreateCategoryRequest, CreateCurrencyRequest, CreateEntryRequest,
+        CreateSourceRequest, Currency, Entry, NewCategory, NewCurrency, NewEntry, NewSource,
+        Source, User,
     },
     AppState,
 };
 
+#[allow(unused)]
 #[derive(Serialize)]
 pub struct CreateResponse {
     #[serde(skip_serializing)]
     id: i32,
+}
+
+#[derive(Serialize)]
+pub struct EmptyResponse {}
+
+#[derive(Serialize)]
+pub struct CountResponse {
+    count: usize,
 }
 
 pub enum ExternalServiceError {
@@ -67,6 +77,7 @@ pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>
             // preventing timing attacks.
             password: format!("$pbkdf2-sha256$i=600000,l=32$XpabVnRzlUG8YOvL$/rdEfUzDwQOBJBCfmc6P3DrbJDo13IrrY+6/O087CSI"),
             fixed_currency_id: None,
+            enabled: true,
         });
     let stored_hash = match PasswordHash::new(&user.password) {
         Ok(hash) => hash,
@@ -92,7 +103,7 @@ pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct UserRequest {
+pub struct CreateUserRequest {
     username: String,
     password: String,
     currency: String,
@@ -100,7 +111,7 @@ pub struct UserRequest {
 
 #[cfg(feature = "create_user")]
 pub async fn create_user(
-    mut data: web::Json<UserRequest>,
+    mut data: web::Json<CreateUserRequest>,
     app_state: web::Data<AppState>,
 ) -> HttpResponse {
     use crate::model::NewUser;
@@ -130,6 +141,7 @@ pub async fn create_user(
                 user_id: user.id,
                 name: std::mem::take(&mut data.currency),
                 rate_to_fixed: 1.0f64,
+                archived: None,
             })
             .execute(&mut app_state.cpool())?;
 
@@ -154,16 +166,16 @@ macro_rules! create_handler {
             user: web::ReqData<User>,
         ) -> HttpResponse {
             use crate::schema::$tb_name::dsl::*;
-            use crate::model::{TryFromRequest, TryFromRequestError};
-            let creatable = <$new as TryFromRequest<$req>>::try_from_request(
+            use crate::model::{StatefulTryFrom, StatefulTryFromError};
+            let creatable = <$new as StatefulTryFrom<$req>>::try_from_request(
                     data.into_inner(),
                     user.into_inner(),
                     app_state.clone().into_inner(),
                 );
             let creatable = match creatable {
                 Err(e) => return match e {
-                    TryFromRequestError::ReferencedDoesNotExist(_) => HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
-                    TryFromRequestError::DateTimeParseError(_) => HttpResponse::BadRequest().body("Malformed date provided"),
+                    StatefulTryFromError::ReferencedDoesNotExist(_) => HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
+                    StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
                 },
                 Ok(c) => c
             };
@@ -181,19 +193,25 @@ macro_rules! create_handler {
 create_handler!(
     create_currency,
     currencies,
-    CurrencyRequest,
+    CreateCurrencyRequest,
     NewCurrency,
     Currency
 );
-create_handler!(create_source, sources, SourceRequest, NewSource, Source);
+create_handler!(
+    create_source,
+    sources,
+    CreateSourceRequest,
+    NewSource,
+    Source
+);
 create_handler!(
     create_category,
     categories,
-    CategoryRequest,
+    CreateCategoryRequest,
     NewCategory,
     Category
 );
-create_handler!(create_entry, entries, EntryRequest, NewEntry, Entry);
+create_handler!(create_entry, entries, CreateEntryRequest, NewEntry, Entry);
 
 macro_rules! get_all_handler {
     ($fn_name:ident, $ent:ident) => {
@@ -242,6 +260,22 @@ get_by_name_handler!(get_currency_by_name, currencies, Currency);
 get_by_name_handler!(get_source_by_name, sources, Source);
 get_by_name_handler!(get_category_by_name, categories, Category);
 
+pub async fn delete_entries(
+    web::Query(ids): web::Query<Vec<i32>>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use crate::schema::entries::dsl::*;
+    let deleted_count =
+        diesel::delete(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&ids)))
+            .execute(&mut app_state.cpool());
+
+    match deleted_count {
+        Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
+        Err(_) => HttpResponse::InternalServerError().body("Failed to delete entries"),
+    }
+}
+
 // TODO: Add support for archival of currencies, sources, categories with balance of 0.
 //  Error message on attempted archival of non-zero currency:
 //  You cannot archive that currency while you still have balance within it. The balance exists in the following sources: <_>
@@ -250,6 +284,8 @@ get_by_name_handler!(get_category_by_name, categories, Category);
 //  or do a currency conversion to a different source of a different currency.
 //  Error message on attempted archival of non-zero category:
 //  You cannot archive that category while it has entries. You can transfer all entries to another category and then proceed.
+
+// TODO: Handlers of type GET should use responses and not entities themselves
 
 /*
 Front end should allow:
