@@ -60,25 +60,62 @@ fn app(
                     web::scope("/currency")
                         .route("", web::post().to(handlers::create_currency))
                         .route("", web::get().to(handlers::get_currencies))
-                        .route("/{name}", web::get().to(handlers::get_currency_by_name)),
+                        .route("/{name}", web::get().to(handlers::get_currency_by_name))
+                        .route("/{name}", web::post().to(handlers::update_currency))
+                        .route("/{name}/archive", web::get().to(handlers::archive_currency))
+                        // TODO
+                        .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
                     web::scope("/source")
                         .route("", web::post().to(handlers::create_source))
                         .route("", web::get().to(handlers::get_sources))
-                        .route("/{name}", web::get().to(handlers::get_source_by_name)),
+                        .route("/{name}", web::get().to(handlers::get_source_by_name))
+                        .route("/{name}", web::post().to(handlers::update_source))
+                        .route("/{name}/archive", web::get().to(handlers::archive_source))
+                        // TODO Entries that have this as source 1 or source 2
+                        .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
                     web::scope("/category")
                         .route("", web::post().to(handlers::create_category))
                         .route("", web::get().to(handlers::get_categories))
-                        .route("/{name}", web::get().to(handlers::get_category_by_name)),
+                        // TODO: Also provide the monthly sums for the last 12 months
+                        .route("/{name}", web::get().to(handlers::get_category_by_name))
+                        .route("/{name}", web::post().to(handlers::update_category))
+                        .route("/{name}/archive", web::get().to(handlers::archive_category))
+                        // TODO
+                        .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
                     web::scope("/entry")
                         .route("", web::post().to(handlers::create_entry))
-                        .route("", web::get().to(handlers::get_entries))
-                        .route("", web::delete().to(handlers::delete_entries)),
+                        // Basic get-all handler, does not return any statistics
+                        .route("/all", web::get().to(handlers::get_entries))
+                        // TODO has the following query parameters:
+                        // - ids (IN) - for multi-select
+                        // - sources (IN)
+                        // - currencies (IN)
+                        // - categories (IN)
+                        // - amount (EQ - care float)
+                        // - min_amount (GTE)
+                        // - max_amount (LTE)
+                        // - date (EQ)
+                        // - after (GTE)
+                        // - before (LTE)
+                        // - created_after (GTE)
+                        // - created_before (LTE)
+                        // - description (LIKE)
+                        // - entry_types (IN)
+                        // - limit (default: 500)
+                        // - sort (comma separated list of values that fall in amount|source|currency|category|date|created_at|entry_type)
+                        // Returns the entries, their sum, their average per month, and their sum-per-category-per-month
+                        .route("", web::get().to(handlers::unimplemented))
+                        // Parameters: ids
+                        .route("update", web::post().to(handlers::unimplemented))
+                        // Parameters: ids
+                        .route("", web::delete().to(handlers::delete_entries))
+                        .route("/archive", web::get().to(handlers::archive_entries)),
                 ),
         );
 

@@ -49,6 +49,40 @@ pub trait GetNameById<N, T> {
     fn get_name_by_id(id: N, app_state: Arc<AppState>) -> Result<T, diesel::result::Error>;
 }
 
+pub trait GetNetAmount {
+    fn get_net_amount<'a>(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error>;
+}
+
+impl GetNetAmount for Currency {
+    fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
+        use crate::schema::sources::dsl::*;
+        let entry_amount_sum: f64 = Source::belonging_to(&self)
+            .filter(archived.eq(false))
+            .select(amount).first::<f64>(&mut app_state.cpool())?;
+        Ok(entry_amount_sum)
+    }
+}
+
+impl GetNetAmount for Source {
+    fn get_net_amount(&self, _app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
+        Ok(self.amount)
+    }
+}
+
+impl GetNetAmount for Category {
+    fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
+        use crate::schema::entries::dsl::*;
+        use diesel::dsl::sum;
+        let entry_amount_sum: f64 = match Entry::belonging_to(&self)
+            .filter(archived.eq(false))
+            .select(sum(amount)).first::<Option<f64>>(&mut app_state.cpool())? {
+            Some(a) => a,
+            None => 0.0f64,
+        };
+        Ok(entry_amount_sum)
+    }
+}
+
 macro_rules! get_impls {
     ($type:ty, $tb_name:ident) => {
         impl GetIdByNameAndUser<Option<String>, Option<i32>> for $type {
@@ -351,9 +385,10 @@ impl StatefulTryFrom<Category> for CategoryResponse {
 #[diesel(belongs_to(User))]
 #[diesel(belongs_to(Source))]
 #[diesel(belongs_to(Category))]
+#[diesel(belongs_to(Currency))]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Entry {
-    #[entity(NotUpdatable, NotViewable, NotSettable, Id)]
+    #[entity(NotUpdatable, NotSettable, Id)]
     pub id: i32,
     #[entity(NotUpdatable, NotViewable, NotSettable)]
     pub user_id: i32,
@@ -464,6 +499,7 @@ impl StatefulTryFrom<Entry> for EntryResponse {
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
         Ok(Self {
+            id: value.id,
             description: value.description,
             category: Category::get_name_by_id(value.category_id, app_state.clone())?,
             amount: value.amount,

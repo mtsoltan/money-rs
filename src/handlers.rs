@@ -8,8 +8,8 @@ use crate::{
     model::{
         Category, CategoryResponse, CreateCategoryRequest, CreateCurrencyRequest,
         CreateEntryRequest, CreateSourceRequest, Currency, CurrencyResponse, Entry, EntryResponse,
-        NewCategory, NewCurrency, NewEntry, NewSource, Source, SourceResponse, StatefulTryFrom,
-        StatefulTryFromError, User,
+        NewCategory, NewCurrency, NewEntry, NewSource, Source, SourceResponse, StatefulTryFrom, GetNetAmount,
+        StatefulTryFromError, User, UpdateCurrency, UpdateCurrencyRequest, UpdateSource, UpdateSourceRequest, UpdateCategory, UpdateCategoryRequest, UpdateEntry, UpdateEntryRequest
     },
     AppState,
 };
@@ -82,7 +82,7 @@ pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>
         });
     let stored_hash = match PasswordHash::new(&user.password) {
         Ok(hash) => hash,
-        Err(_) => return HttpResponse::InternalServerError().body("E002"),
+        Err(_) => return HttpResponse::InternalServerError().body("E002: Failed to log in"),
     };
 
     if items.len() > 1 {
@@ -154,7 +154,7 @@ pub async fn create_user(
         Err(ExternalServiceError::DieselError(_)) => {
             HttpResponse::BadRequest().body("User already exists")
         }
-        Err(ExternalServiceError::HashError(_)) => HttpResponse::InternalServerError().body("E001"),
+        Err(ExternalServiceError::HashError(_)) => HttpResponse::InternalServerError().body("E001: Failed to create entities"),
     }
 }
 
@@ -227,7 +227,7 @@ macro_rules! get_all_handler {
             let fetched = match $ent::belonging_to(&user)
                 .select($ent::as_select())
                 .load(&mut app_state.cpool()) {
-                    Err(_) => return HttpResponse::InternalServerError().body("E003"),
+                    Err(_) => return HttpResponse::InternalServerError().body("E003: Failed to get entities"),
                     Ok(f) => f,
                 };
             let responses = fetched.into_iter()
@@ -251,6 +251,13 @@ get_all_handler!(get_currencies, Currency, CurrencyResponse);
 get_all_handler!(get_sources, Source, SourceResponse);
 get_all_handler!(get_categories, Category, CategoryResponse);
 get_all_handler!(get_entries, Entry, EntryResponse);
+
+pub async fn unimplemented(
+    _app_state: web::Data<AppState>,
+    _user: web::ReqData<User>,
+) -> HttpResponse {
+    HttpResponse::NotImplemented().body(format!("Unimplemented."))
+}
 
 macro_rules! get_by_name_handler {
     ($fn_name:ident, $tb_name:ident, $ent:ident, $resp:ident) => {
@@ -286,32 +293,129 @@ get_by_name_handler!(get_currency_by_name, currencies, Currency, CurrencyRespons
 get_by_name_handler!(get_source_by_name, sources, Source, SourceResponse);
 get_by_name_handler!(get_category_by_name, categories, Category, CategoryResponse);
 
+#[derive(Debug, Deserialize)]
+pub struct BulkRequest {
+   ids: Vec<i32>,
+}
+
 pub async fn delete_entries(
-    web::Query(ids): web::Query<Vec<i32>>,
+    web::Query(req): web::Query<BulkRequest>,
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
     use crate::schema::entries::dsl::*;
     let deleted_count =
-        diesel::delete(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&ids)))
+        diesel::delete(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&req.ids)))
             .execute(&mut app_state.cpool());
 
     match deleted_count {
         Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
-        Err(_) => HttpResponse::InternalServerError().body("Failed to delete entries"),
+        Err(_) => HttpResponse::InternalServerError().body("E004: Failed to delete entities"),
     }
 }
 
-// TODO: Build update handlers
+pub async fn archive_entries(
+    web::Query(ids): web::Query<Vec<i32>>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use crate::schema::entries::dsl::*;
+    let updated_count = diesel::update(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&ids)))
+        .set(archived.eq(true)).execute(&mut app_state.cpool());
+    match updated_count {
+        Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
+        Err(_) => HttpResponse::InternalServerError().body("E005: Failed to archive entities"),
+    }
+}
 
-// TODO: Add support for archival of currencies, sources, categories with balance of 0.
-//  Error message on attempted archival of non-zero currency:
-//  You cannot archive that currency while you still have balance within it. The balance exists in the following sources: <_>
-//  Error message on attempted archival of non-zero source:
-//  You cannot archive that source while it still has balance. You can transfer all balance to another source of the same currency
-//  or do a currency conversion to a different source of a different currency.
-//  Error message on attempted archival of non-zero category:
-//  You cannot archive that category while it has entries. You can transfer all entries to another category and then proceed.
+
+macro_rules! update_handler {
+    ($fn_name:ident, $tb_name:ident, $ent:ident, $changeset:ident, $req:ident) => {
+        pub async fn $fn_name(
+            path_name: web::Path<String>,
+            app_state: web::Data<AppState>,
+            data: web::Json<$req>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            use crate::schema::$tb_name::dsl::*;
+            let user = user.into_inner();
+            let app_state = app_state.into_inner();
+            let path_name = path_name.into_inner();
+            let data = data.into_inner();
+            let change_set = match $changeset::stateful_try_from(data, &user, app_state.clone()) {
+                Err(e) => return match e {
+                    StatefulTryFromError::ReferencedDoesNotExist(_) =>
+                        HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
+                    StatefulTryFromError::DateTimeParseError(_) =>
+                        HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
+                },
+                Ok(c) => c,
+            };
+            let count: usize = match diesel::update($ent::belonging_to(&user)
+                .filter(name.eq(&path_name)))
+                .set(change_set)
+                .execute(&mut app_state.cpool()) {
+                    Ok(f) => f,
+                    Err(_) => return HttpResponse::NotFound().body("Entity not found"),
+                };
+            HttpResponse::Ok().json(CountResponse { count })
+        }
+    };
+}
+
+update_handler!(update_currency, currencies, Currency, UpdateCurrency, UpdateCurrencyRequest);
+update_handler!(update_source, sources, Source, UpdateSource, UpdateSourceRequest);
+update_handler!(update_category, categories, Category, UpdateCategory, UpdateCategoryRequest);
+
+macro_rules! archive_handler {
+    ($fn_name:ident, $tb_name:ident, $ent:ident, $err:expr) => {
+        pub async fn $fn_name(
+            path_name: web::Path<String>,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            use crate::schema::$tb_name::dsl::*;
+            let user = user.into_inner();
+            let app_state = app_state.into_inner();
+            let path_name = path_name.into_inner();
+            let fetched = match $ent::belonging_to(&user)
+            .filter(name.eq(&path_name))
+            .first::<$ent>(&mut app_state.cpool()) {
+                Ok(f) => f,
+                Err(_) => return HttpResponse::NotFound().body("Entity not found"),
+            };
+            let net_amount = match fetched.get_net_amount(app_state.clone()) {
+                Ok(t) => t,
+                Err(_) => return HttpResponse::InternalServerError().body("E006: Unable to construct sum - failed to archive"),
+            };
+            if net_amount != 0f64 {
+                return HttpResponse::BadRequest().body($err);
+            }
+            let count: usize = match diesel::update(&fetched)
+                .set(archived.eq(true))
+                .execute(&mut app_state.cpool()) {
+                    Ok(f) => f,
+                    Err(_) => return HttpResponse::NotFound().body("Entity not found"),
+                };
+            HttpResponse::Ok().json(CountResponse { count })
+        }
+    };
+}
+
+// TODO: FE should send another GET request for sources to display:
+//  The balance exists in the following sources: <_>
+archive_handler!(archive_currency, currencies, Currency, "\
+    You cannot archive that currency while you still have balance within it.\
+");
+archive_handler!(archive_source, sources, Source, "\
+    You cannot archive that source while it still has balance. \
+    You can transfer all balance to another source of the same currency or \
+    do a currency conversion to a different source of a different currency. \
+");
+archive_handler!(archive_category, categories, Category, "\
+    You cannot archive that category while it has entries. \
+    You can transfer all entries to another category and then proceed.\
+");
 
 // TODO: Work on BE of filtering, searching, bulk editing, and displaying required for FE
 
@@ -344,4 +448,8 @@ Front end should allow:
 
 # Sources functionality
 - TODO
+
+# General front-end
+- Tables
+- Printing
 */
