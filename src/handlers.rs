@@ -1,15 +1,15 @@
+use std::collections::HashMap;
+
 use ::pbkdf2::Pbkdf2;
 use actix_web::{web, HttpRequest, HttpResponse};
 use diesel::{insert_into, prelude::*};
 use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{
     model::{
-        Category, CategoryResponse, CreateCategoryRequest, CreateCurrencyRequest,
-        CreateEntryRequest, CreateSourceRequest, Currency, CurrencyResponse, Entry, EntryResponse,
-        NewCategory, NewCurrency, NewEntry, NewSource, Source, SourceResponse, StatefulTryFrom, GetNetAmount,
-        StatefulTryFromError, User, UpdateCurrency, UpdateCurrencyRequest, UpdateSource, UpdateSourceRequest, UpdateCategory, UpdateCategoryRequest, UpdateEntry, UpdateEntryRequest
+        Category, CategoryResponse, CreateCategoryRequest, CreateCurrencyRequest, CreateEntryRequest, CreateSourceRequest, Currency, CurrencyResponse, Entry, EntryQuery, EntryResponse, GetNetAmount, NewCategory, NewCurrency, NewEntry, NewSource, Source, SourceResponse, StatefulTryFrom, StatefulTryFromError, UpdateCategory, UpdateCategoryRequest, UpdateCurrency, UpdateCurrencyRequest, UpdateEntry, UpdateEntryRequest, UpdateSource, UpdateSourceRequest, User
     },
     AppState,
 };
@@ -52,9 +52,9 @@ pub struct LoginRequest {
     password: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LoginResponse {
-    token: String,
+    pub token: String,
 }
 
 pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>) -> HttpResponse {
@@ -110,7 +110,7 @@ pub struct CreateUserRequest {
     currency: String,
 }
 
-#[cfg(feature = "create_user")]
+#[cfg(any(test, feature = "create_user"))]
 pub async fn create_user(
     mut data: web::Json<CreateUserRequest>,
     app_state: web::Data<AppState>,
@@ -155,6 +155,25 @@ pub async fn create_user(
             HttpResponse::BadRequest().body("User already exists")
         }
         Err(ExternalServiceError::HashError(_)) => HttpResponse::InternalServerError().body("E001: Failed to create entities"),
+    }
+}
+
+#[cfg(any(test, feature = "create_user"))]
+pub async fn delete_user(
+    path_username: web::Path<String>,
+    app_state: web::Data<AppState>,
+) -> HttpResponse {
+    use crate::schema::users::dsl::*;
+    let path_username = path_username.into_inner();
+    let deleted_count =
+        diesel::delete(users.filter(username.eq(path_username)))
+            .execute(&mut app_state.cpool());
+
+    match deleted_count {
+        Ok(1) => HttpResponse::Ok().json(json!({})),
+        Ok(0) => HttpResponse::NotFound().finish(),
+        Ok(2..) => HttpResponse::InternalServerError().body("E009: Deleted more than one user"),
+        Err(_) => HttpResponse::InternalServerError().body("E008: Failed to delete user"),
     }
 }
 
@@ -417,7 +436,50 @@ archive_handler!(archive_category, categories, Category, "\
     You can transfer all entries to another category and then proceed.\
 ");
 
+pub async fn find_entries(
+    query_params: web::Query<EntryQuery>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    let query_params = query_params.into_inner();
+    let user = user.into_inner();
+    let app_state = app_state.into_inner();
+
+    match Entry::find_by_filter(&query_params, &user, app_state) {
+        Ok(entries) => {
+            let sum_amounts: f64 = entries.iter().map(|entry| entry.amount).sum();
+
+
+            let mut sum_per_month: HashMap<String, f64> = HashMap::new();
+            for entry in &entries {
+                let month_year = entry.date.format("%Y-%m").to_string();
+                *sum_per_month.entry(month_year).or_insert(0.0) += entry.amount;
+            }
+            let num_months = sum_per_month.len() as f64;
+            let avg_per_month = sum_amounts / num_months;
+
+            let mut sum_per_category_per_month: HashMap<(i32, String), f64> = HashMap::new();
+            for entry in &entries {
+                let month_year = entry.date.format("%Y-%m").to_string();
+                let category_month_key = (entry.category_id.clone(), month_year.clone());
+                *sum_per_category_per_month.entry(category_month_key).or_insert(0.0) += entry.amount;
+            }
+
+            HttpResponse::Ok().json(serde_json::json!({
+                "sum_per_month": sum_per_month,
+                "avg_per_month": avg_per_month,
+                "sum_per_category_per_month": sum_per_category_per_month,
+                "entries": entries,
+            }))
+        }
+        Err(_) => {
+            HttpResponse::InternalServerError().body("E007: Error finding entries")
+        }
+    }
+}
+
 // TODO: Work on BE of filtering, searching, bulk editing, and displaying required for FE
+// TODO: Log errors in stderr in case of internal server errors
 
 /*
 Front end should allow:
@@ -452,4 +514,7 @@ Front end should allow:
 # General front-end
 - Tables
 - Printing
+
+TODO at the very end: Look into diesel async, whcih would only require adding .await after each cpool() execute / load.
+Look into the 3 other pooling crates other than r2d2.
 */

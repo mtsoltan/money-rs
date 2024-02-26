@@ -515,3 +515,140 @@ impl StatefulTryFrom<Entry> for EntryResponse {
         })
     }
 }
+
+
+/// - ids (IN) - for multi-select
+/// - sources (IN)
+/// - currencies (IN)
+/// - categories (IN)
+/// - amount (EQ - care float)
+/// - min_amount (GTE)
+/// - max_amount (LTE)
+/// - date (EQ)
+/// - after (GTE)
+/// - before (LTE)
+/// - created_after (GTE)
+/// - created_before (LTE)
+/// - description (LIKE)
+/// - entry_types (IN)
+/// - limit (default: 500)
+#[derive(Deserialize)]
+pub struct EntryQuery {
+    ids: Option<Vec<i32>>,
+    sources: Option<Vec<String>>,
+    currencies: Option<Vec<String>>,
+    categories: Option<Vec<String>>,
+    amount: Option<f64>,
+    min_amount: Option<f64>,
+    max_amount: Option<f64>,
+    date: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    created_after: Option<String>,
+    created_before: Option<String>,
+    description: Option<String>,
+    entry_types: Option<Vec<EntryType>>,
+    limit: Option<i64>,
+    sort: Option<String>,
+}
+
+impl Entry {
+    pub fn find_by_filter(query_params: &EntryQuery, user: &User, app_state: Arc<AppState>) -> Result<Vec<Entry>, StatefulTryFromError> {
+        use crate::schema::entries::dsl::*;
+        let mut query = entries.into_boxed();
+
+        if let Some(ids) = &query_params.ids {
+            query = query.filter(id.eq_any(ids));
+        }
+
+        if let Some(names) = &query_params.sources {
+            let ids: Vec<_> = names.iter().filter_map(|name| {
+                Source::get_id_by_name_and_user(name.clone(), &user, app_state.clone())
+                    .ok()
+            }).collect();
+
+            query = query.filter(source_id.eq_any(ids));
+        }
+        if let Some(names) = &query_params.currencies {
+            let ids: Vec<_> = names.iter().filter_map(|name| {
+                Currency::get_id_by_name_and_user(name.clone(), &user, app_state.clone())
+                    .ok()
+            }).collect();
+
+            query = query.filter(currency_id.eq_any(ids));
+        }
+        if let Some(names) = &query_params.categories {
+            let ids: Vec<_> = names.iter().filter_map(|name| {
+                Category::get_id_by_name_and_user(name.clone(), &user, app_state.clone())
+                    .ok()
+            }).collect();
+
+            query = query.filter(category_id.eq_any(ids));
+        }
+
+        if let Some(q_amount) = &query_params.amount {
+            query = query.filter(amount.eq(q_amount));
+        }
+
+        if let Some(min_amount) = query_params.min_amount {
+            query = query.filter(amount.ge(min_amount));
+        }
+
+        if let Some(max_amount) = query_params.max_amount {
+            query = query.filter(amount.le(max_amount));
+        }
+
+        if let Some(q_date) = &query_params.date {
+            let ndt: NaiveDateTime = NaiveDate::parse_from_str(q_date, "%F")?.into();
+            query = query.filter(date.eq(ndt));
+        }
+
+        if let Some(after) = &query_params.after {
+            let ndt: NaiveDateTime = NaiveDate::parse_from_str(after, "%F")?.into();
+            query = query.filter(date.gt(ndt));
+        }
+
+        if let Some(before) = &query_params.before {
+            let ndt: NaiveDateTime = NaiveDate::parse_from_str(before, "%F")?.into();
+            query = query.filter(date.lt(ndt));
+        }
+
+        if let Some(created_after) = &query_params.created_after {
+            let created_after_datetime = NaiveDateTime::parse_from_str(created_after, "%+")?;
+
+            query = query.filter(created_at.gt(created_after_datetime));
+        }
+
+        if let Some(created_before) = &query_params.created_before {
+            let created_before_datetime = NaiveDateTime::parse_from_str(created_before, "%+")?;
+
+            query = query.filter(created_at.lt(created_before_datetime));
+        }
+
+        if let Some(q_description) = &query_params.description {
+            query = query.filter(description.ilike(format!("%{q_description}%")));
+        }
+
+        if let Some(entry_types) = &query_params.entry_types {
+            query = query.filter(entry_type.eq_any(entry_types));
+        }
+
+        if let Some(limit) = query_params.limit {
+            query = query.limit(limit);
+        }
+
+        if let Some(sort) = &query_params.sort {
+            match sort.as_str() {
+                "amount_asc" => query = query.order(amount.asc()),
+                "amount_desc" => query = query.order(amount.desc()),
+                "date_asc" => query = query.order(date.asc()),
+                "date_desc" => query = query.order(date.desc()),
+                _ => (),
+            }
+        }
+
+        let r_entries = query.load::<Entry>(&mut app_state.cpool())?;
+
+        Ok(r_entries)
+    }
+}
