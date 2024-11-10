@@ -1,50 +1,71 @@
 use std::collections::HashMap;
+use std::fmt::Debug;
 
 use ::pbkdf2::Pbkdf2;
 use actix_web::{web, HttpRequest, HttpResponse};
 use diesel::insert_into;
 use diesel::prelude::*;
+use log::error;
 use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+#[allow(unused_imports)]
 use crate::{
     model::{
-        Category, CategoryResponse, CreateCategoryRequest, CreateCurrencyRequest, CreateEntryRequest, CreateSourceRequest, Currency, CurrencyResponse, Entry, EntryQuery, EntryResponse, GetNetAmount, NewCategory, NewCurrency, NewEntry, NewSource, Source, SourceResponse, StatefulTryFrom, StatefulTryFromError, UpdateCategory, UpdateCategoryRequest, UpdateCurrency, UpdateCurrencyRequest, UpdateEntry, UpdateEntryRequest, UpdateSource, UpdateSourceRequest, User
+        Category, CategoryResponse, CreateCategoryRequest, CreateCurrencyRequest,
+        CreateEntryRequest, CreateSourceRequest, Currency, CurrencyResponse, Entry, EntryQuery,
+        EntryResponse, GetNetAmount, HasSpecifier, NewCategory, NewCurrency, NewEntry, NewSource,
+        Source, SourceResponse, StatefulTryFrom, StatefulTryFromError, UpdateCategory,
+        UpdateCategoryRequest, UpdateCurrency, UpdateCurrencyRequest, UpdateEntry,
+        UpdateEntryRequest, UpdateSource, UpdateSourceRequest, User,
     },
     AppState,
 };
 
-#[allow(unused)]
-#[derive(Serialize)]
-pub struct CreateResponse {
-    #[serde(skip_serializing)]
-    id: i32,
+/// this whole thing with string-gen could be static, since the format! only takes static args,
+/// but it's not worth the effort, so we're using Into<String> and using heap-allocated,
+/// copied-on-demand strings for this.
+fn internal<T: Into<String>>(debuggable: impl Debug, e: T) -> HttpResponse {
+    let e = e.into();
+    // TODO: Check why the error logs are not showing up in tests (and if they'll show up live)
+    error!("{}:\n{:?}", e, debuggable);
+    HttpResponse::InternalServerError().body(e)
 }
 
-#[derive(Serialize)]
+// We cannot skip serialization in any of the fields in the response, as in the tests,
+// we will need to reconstruct the response from the JSON string to reason about it,
+// in order to not have to write code that uses maps.
+//
+// The exception is CreateResponse, which serializes as empty response.
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateResponse {
+    pub id: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EmptyResponse {}
 
-#[derive(Serialize)]
+/// Used only when performing group-operation on entries (not entities).
+/// Examples are deleting and archiving and block-updating entries.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CountResponse {
-    count: usize,
+    pub count: usize,
 }
 
+#[allow(dead_code)]
 pub enum ExternalServiceError {
     HashError(password_hash::Error),
     DieselError(diesel::result::Error),
 }
 
 impl From<password_hash::Error> for ExternalServiceError {
-    fn from(value: password_hash::Error) -> Self {
-        Self::HashError(value)
-    }
+    fn from(value: password_hash::Error) -> Self { Self::HashError(value) }
 }
 
 impl From<diesel::result::Error> for ExternalServiceError {
-    fn from(value: diesel::result::Error) -> Self {
-        Self::DieselError(value)
-    }
+    fn from(value: diesel::result::Error) -> Self { Self::DieselError(value) }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,19 +92,20 @@ pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>
         err += 1;
     }
 
-    let user = items.pop().unwrap_or(
-        User {
-            id: 0,
-            username: format!(""),
-            // Some random hash to ensure hash comparison runs even if user does not exist,
-            // preventing timing attacks.
-            password: format!("$pbkdf2-sha256$i=600000,l=32$XpabVnRzlUG8YOvL$/rdEfUzDwQOBJBCfmc6P3DrbJDo13IrrY+6/O087CSI"),
-            fixed_currency_id: None,
-            enabled: true,
-        });
+    let user = items.pop().unwrap_or(User {
+        id: 0,
+        username: "".to_string(),
+        // Some random hash to ensure hash comparison runs even if user does not exist,
+        // preventing timing attacks.
+        password: "$pbkdf2-sha256$i=600000,l=32$XpabVnRzlUG8YOvL$/\
+                   rdEfUzDwQOBJBCfmc6P3DrbJDo13IrrY+6/O087CSI"
+            .to_string(),
+        fixed_currency_id: None,
+        enabled: true,
+    });
     let stored_hash = match PasswordHash::new(&user.password) {
         Ok(hash) => hash,
-        Err(_) => return HttpResponse::InternalServerError().body("E002: Failed to log in"),
+        Err(e) => return internal(e, "E002: Failed to log in"),
     };
 
     if items.len() > 1 {
@@ -150,10 +172,8 @@ pub async fn create_user(
 
     match created_user {
         Ok(u) => HttpResponse::Ok().json(CreateResponse { id: u.id }),
-        Err(ExternalServiceError::DieselError(_)) => {
-            HttpResponse::BadRequest().body("User already exists")
-        }
-        Err(ExternalServiceError::HashError(_)) => HttpResponse::InternalServerError().body("E001: Failed to create entities"),
+        Err(ExternalServiceError::DieselError(e)) => internal(e, "User already exists"),
+        Err(ExternalServiceError::HashError(e)) => internal(e, "E001: Failed to create entities"),
     }
 }
 
@@ -165,14 +185,25 @@ pub async fn delete_user(
     use crate::schema::users::dsl::*;
     let path_username = path_username.into_inner();
     let deleted_count =
-        diesel::delete(users.filter(username.eq(path_username)))
-            .execute(&mut app_state.cpool());
+        diesel::delete(users.filter(username.eq(path_username))).execute(&mut app_state.cpool());
 
     match deleted_count {
-        Ok(1) => HttpResponse::Ok().json(json!({})),
+        Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
         Ok(0) => HttpResponse::NotFound().finish(),
-        Ok(2..) => HttpResponse::InternalServerError().body("E009: Deleted more than one user"),
-        Err(_) => HttpResponse::InternalServerError().body("E008: Failed to delete user"),
+        Ok(2..) => internal("No underlying error", "E009: Deleted more than one user"),
+        Err(e) => internal(e, "E008: Failed to delete user"),
+    }
+}
+
+impl From<StatefulTryFromError> for HttpResponse {
+    fn from(error: StatefulTryFromError) -> HttpResponse {
+        match error {
+            StatefulTryFromError::ReferencedDoesNotExist(_) => HttpResponse::BadRequest()
+                .body("One of the currencies / categories / sources you referenced does not exist"),
+            StatefulTryFromError::DateTimeParseError(_) => {
+                HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD")
+            }
+        }
     }
 }
 
@@ -186,51 +217,30 @@ macro_rules! create_handler {
         ) -> HttpResponse {
             use crate::schema::$tb_name::dsl::*;
             let creatable = <$new as StatefulTryFrom<$req>>::stateful_try_from(
-                    data.into_inner(),
-                    &user.into_inner(),
-                    app_state.clone().into_inner(),
-                );
+                data.into_inner(),
+                &user.into_inner(),
+                app_state.clone().into_inner(),
+            );
             let creatable = match creatable {
-                Err(e) => return match e {
-                    StatefulTryFromError::ReferencedDoesNotExist(_) =>
-                        HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
-                    StatefulTryFromError::DateTimeParseError(_) =>
-                        HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
-                },
+                Err(e) => return HttpResponse::from(e),
                 Ok(c) => c,
             };
-            let created = insert_into($tb_name)
-                .values(creatable)
-                .get_result::<$ent>(&mut app_state.cpool());
+            let created =
+                insert_into($tb_name).values(creatable).get_result::<$ent>(&mut app_state.cpool());
             match created {
                 Ok(c) => HttpResponse::Ok().json(CreateResponse { id: c.id }),
-                Err(_) => HttpResponse::BadRequest().body("Entity already exists"),
+                // TODO: Only duplicate key error should give already exists.
+                //  The other errors should throw 500
+                Err(_) => HttpResponse::BadRequest()
+                    .body(format!("{} already exists", <$ent>::specifier())),
             }
         }
     };
 }
 
-create_handler!(
-    create_currency,
-    currencies,
-    CreateCurrencyRequest,
-    NewCurrency,
-    Currency
-);
-create_handler!(
-    create_source,
-    sources,
-    CreateSourceRequest,
-    NewSource,
-    Source
-);
-create_handler!(
-    create_category,
-    categories,
-    CreateCategoryRequest,
-    NewCategory,
-    Category
-);
+create_handler!(create_currency, currencies, CreateCurrencyRequest, NewCurrency, Currency);
+create_handler!(create_source, sources, CreateSourceRequest, NewSource, Source);
+create_handler!(create_category, categories, CreateCategoryRequest, NewCategory, Category);
 create_handler!(create_entry, entries, CreateEntryRequest, NewEntry, Entry);
 
 macro_rules! get_all_handler {
@@ -244,21 +254,34 @@ macro_rules! get_all_handler {
             let app_state = app_state.into_inner();
             let fetched = match $ent::belonging_to(&user)
                 .select($ent::as_select())
-                .load(&mut app_state.cpool()) {
-                    Err(_) => return HttpResponse::InternalServerError().body("E003: Failed to get entities"),
-                    Ok(f) => f,
-                };
-            let responses = fetched.into_iter()
+                .load(&mut app_state.cpool())
+            {
+                Err(e) => {
+                    return internal(
+                        e,
+                        format!("E003: Failed to get all {}", $ent::specifier_plural()).as_str(),
+                    )
+                }
+                Ok(f) => f,
+            };
+            let responses = fetched
+                .into_iter()
                 .map(|f| $resp::stateful_try_from(f, &user, app_state.clone()))
                 .collect::<Result<Vec<$resp>, _>>();
 
             match responses {
-                Err(e) => return match e {
-                    StatefulTryFromError::ReferencedDoesNotExist(_) =>
-                        HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
-                    StatefulTryFromError::DateTimeParseError(_) =>
-                        HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
-                },
+                Err(e) => {
+                    return match e {
+                        StatefulTryFromError::ReferencedDoesNotExist(_) => {
+                            HttpResponse::BadRequest().body(
+                                "One of the currencies / categories / sources you referenced does \
+                                 not exist",
+                            )
+                        }
+                        StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest()
+                            .body("Malformed date provided - please use YYYY-MM-DD"),
+                    }
+                }
                 Ok(c) => HttpResponse::Ok().json(c),
             }
         }
@@ -274,7 +297,7 @@ pub async fn unimplemented(
     _app_state: web::Data<AppState>,
     _user: web::ReqData<User>,
 ) -> HttpResponse {
-    HttpResponse::NotImplemented().body(format!("Unimplemented."))
+    HttpResponse::NotImplemented().body("Unimplemented.".to_string())
 }
 
 macro_rules! get_by_name_handler {
@@ -291,16 +314,29 @@ macro_rules! get_by_name_handler {
             let fetched = match $ent::belonging_to(&user)
                 .filter(name.eq(&path_name))
                 .select($ent::as_select())
-                .first(&mut app_state.cpool()) {
-                    Ok(f) => f,
-                    Err(_) => return HttpResponse::NotFound().body("Entity not found"),
-                };
+                .first(&mut app_state.cpool())
+            {
+                Ok(f) => f,
+                // TODO: Only duplicate key error should give already exists.
+                //  The other errors should throw 500
+                Err(_) => {
+                    return HttpResponse::NotFound().body(format!("{} not found", $ent::specifier()))
+                }
+            };
             let response = $resp::stateful_try_from(fetched, &user, app_state.clone());
             match response {
-                Err(e) => return match e {
-                    StatefulTryFromError::ReferencedDoesNotExist(_) => HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
-                    StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
-                },
+                Err(e) => {
+                    return match e {
+                        StatefulTryFromError::ReferencedDoesNotExist(_) => {
+                            HttpResponse::BadRequest().body(
+                                "One of the currencies / categories / sources you referenced does \
+                                 not exist",
+                            )
+                        }
+                        StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest()
+                            .body("Malformed date provided - please use YYYY-MM-DD"),
+                    }
+                }
                 Ok(entity) => HttpResponse::Ok().json(entity),
             }
         }
@@ -328,7 +364,7 @@ pub async fn delete_entries(
 
     match deleted_count {
         Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
-        Err(_) => HttpResponse::InternalServerError().body("E004: Failed to delete entities"),
+        Err(e) => internal(e, "E004: Failed to delete entities"),
     }
 }
 
@@ -338,14 +374,15 @@ pub async fn archive_entries(
     user: web::ReqData<User>,
 ) -> HttpResponse {
     use crate::schema::entries::dsl::*;
-    let updated_count = diesel::update(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&ids)))
-        .set(archived.eq(true)).execute(&mut app_state.cpool());
+    let updated_count =
+        diesel::update(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&ids)))
+            .set(archived.eq(true))
+            .execute(&mut app_state.cpool());
     match updated_count {
         Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
-        Err(_) => HttpResponse::InternalServerError().body("E005: Failed to archive entities"),
+        Err(e) => internal(e, "E005: Failed to archive entities"),
     }
 }
-
 
 macro_rules! update_handler {
     ($fn_name:ident, $tb_name:ident, $ent:ident, $changeset:ident, $req:ident) => {
@@ -361,22 +398,34 @@ macro_rules! update_handler {
             let path_name = path_name.into_inner();
             let data = data.into_inner();
             let change_set = match $changeset::stateful_try_from(data, &user, app_state.clone()) {
-                Err(e) => return match e {
-                    StatefulTryFromError::ReferencedDoesNotExist(_) =>
-                        HttpResponse::BadRequest().body("One of the currencies / categories / sources you referenced does not exist"),
-                    StatefulTryFromError::DateTimeParseError(_) =>
-                        HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD"),
-                },
+                Err(e) => {
+                    return match e {
+                        StatefulTryFromError::ReferencedDoesNotExist(_) => {
+                            HttpResponse::BadRequest().body(
+                                "One of the currencies / categories / sources you referenced does \
+                                 not exist",
+                            )
+                        }
+                        StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest()
+                            .body("Malformed date provided - please use YYYY-MM-DD"),
+                    }
+                }
                 Ok(c) => c,
             };
-            let count: usize = match diesel::update($ent::belonging_to(&user)
-                .filter(name.eq(&path_name)))
+            match diesel::update($ent::belonging_to(&user).filter(name.eq(&path_name)))
                 .set(change_set)
-                .execute(&mut app_state.cpool()) {
-                    Ok(f) => f,
-                    Err(_) => return HttpResponse::NotFound().body("Entity not found"),
-                };
-            HttpResponse::Ok().json(CountResponse { count })
+                .execute(&mut app_state.cpool())
+            {
+                Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
+                Ok(0) => HttpResponse::NotFound().finish(),
+                Ok(2..) => internal(
+                    "No underlying error",
+                    format!("E010: Updated more than one {}", $ent::specifier()),
+                ),
+                Err(e) => {
+                    return internal(e, format!("E011: Could not update {}", $ent::specifier()))
+                }
+            }
         }
     };
 }
@@ -397,43 +446,59 @@ macro_rules! archive_handler {
             let app_state = app_state.into_inner();
             let path_name = path_name.into_inner();
             let fetched = match $ent::belonging_to(&user)
-            .filter(name.eq(&path_name))
-            .first::<$ent>(&mut app_state.cpool()) {
+                .filter(name.eq(&path_name))
+                .first::<$ent>(&mut app_state.cpool())
+            {
                 Ok(f) => f,
-                Err(_) => return HttpResponse::NotFound().body("Entity not found"),
+                Err(_) => {
+                    return HttpResponse::NotFound().body(format!("{} not found", $ent::specifier()))
+                }
             };
             let net_amount = match fetched.get_net_amount(app_state.clone()) {
                 Ok(t) => t,
-                Err(_) => return HttpResponse::InternalServerError().body("E006: Unable to construct sum - failed to archive"),
+                Err(e) => return internal(e, "E006: Unable to construct sum - failed to archive"),
             };
             if net_amount != 0f64 {
                 return HttpResponse::BadRequest().body($err);
             }
-            let count: usize = match diesel::update(&fetched)
-                .set(archived.eq(true))
-                .execute(&mut app_state.cpool()) {
-                    Ok(f) => f,
-                    Err(_) => return HttpResponse::NotFound().body("Entity not found"),
-                };
-            HttpResponse::Ok().json(CountResponse { count })
+            match diesel::update(&fetched).set(archived.eq(true)).execute(&mut app_state.cpool()) {
+                Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
+                Ok(0) => HttpResponse::NotFound().finish(),
+                Ok(2..) => internal(
+                    "No underlying error",
+                    format!("E012: Archived more than one {}", $ent::specifier()).as_str(),
+                ),
+                Err(e) => {
+                    internal(e, format!("E013: Could not archive {}", $ent::specifier()).as_str())
+                }
+            }
         }
     };
 }
 
 // TODO: FE should send another GET request for sources to display:
 //  The balance exists in the following sources: <_>
-archive_handler!(archive_currency, currencies, Currency, "\
-    You cannot archive that currency while you still have balance within it.\
-");
-archive_handler!(archive_source, sources, Source, "\
-    You cannot archive that source while it still has balance. \
-    You can transfer all balance to another source of the same currency or \
-    do a currency conversion to a different source of a different currency. \
-");
-archive_handler!(archive_category, categories, Category, "\
-    You cannot archive that category while it has entries. \
-    You can transfer all entries to another category and then proceed.\
-");
+archive_handler!(
+    archive_currency,
+    currencies,
+    Currency,
+    "You cannot archive that currency while you still have balance within it."
+);
+archive_handler!(
+    archive_source,
+    sources,
+    Source,
+    "You cannot archive that source while it still has balance. You can transfer all balance to \
+     another source of the same currency or do a currency conversion to a different source of a \
+     different currency. "
+);
+archive_handler!(
+    archive_category,
+    categories,
+    Category,
+    "You cannot archive that category while it has entries. You can transfer all entries to \
+     another category and then proceed."
+);
 
 pub async fn find_entries(
     query_params: web::Query<EntryQuery>,
@@ -447,7 +512,6 @@ pub async fn find_entries(
     match Entry::find_by_filter(&query_params, &user, app_state) {
         Ok(entries) => {
             let sum_amounts: f64 = entries.iter().map(|entry| entry.amount).sum();
-
 
             let mut sum_per_month: HashMap<String, f64> = HashMap::new();
             for entry in &entries {
@@ -465,21 +529,19 @@ pub async fn find_entries(
                     entry.amount;
             }
 
-            HttpResponse::Ok().json(serde_json::json!({
+            // TODO: Replace me with a proper response struct
+            HttpResponse::Ok().json(json!({
                 "sum_per_month": sum_per_month,
                 "avg_per_month": avg_per_month,
                 "sum_per_category_per_month": sum_per_category_per_month,
                 "entries": entries,
             }))
         }
-        Err(_) => {
-            HttpResponse::InternalServerError().body("E007: Error finding entries")
-        }
+        Err(e) => internal(e, "E007: Error finding entries"),
     }
 }
 
 // TODO: Work on BE of filtering, searching, bulk editing, and displaying required for FE
-// TODO: Log errors in stderr in case of internal server errors
 
 /*
 Front end should allow:

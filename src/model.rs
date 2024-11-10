@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use diesel::*;
+use inner_macros::Entity;
 use serde::{Deserialize, Serialize};
 
 // Needed by macros
 use crate::schema::sql_types::EntryT;
-use crate::{schema::*, AppState};
-
-use inner_macros::Entity;
+use crate::schema::*;
+use crate::AppState;
 
 #[derive(Debug, PartialEq, Clone, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
 #[ExistingTypePath = "EntryT"]
@@ -20,6 +20,7 @@ pub enum EntryType {
     Convert,
 }
 
+#[derive(Debug)]
 pub enum StatefulTryFromError {
     ReferencedDoesNotExist(diesel::result::Error),
     DateTimeParseError(chrono::format::ParseError),
@@ -54,7 +55,10 @@ impl GetNetAmount for Currency {
         use crate::schema::sources::dsl::*;
         let entry_amount_sum: f64 = Source::belonging_to(&self)
             .filter(archived.eq(false))
-            .select(amount).first::<f64>(&mut app_state.cpool())?;
+            .select(amount)
+            .load(&mut app_state.cpool())?
+            .iter()
+            .sum();
         Ok(entry_amount_sum)
     }
 }
@@ -67,14 +71,16 @@ impl GetNetAmount for Source {
 
 impl GetNetAmount for Category {
     fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
-        use crate::schema::entries::dsl::*;
         use diesel::dsl::sum;
-        let entry_amount_sum: f64 = match Entry::belonging_to(&self)
+
+        use crate::schema::entries::dsl::*;
+        let entry_amount_sum: f64 = Entry::belonging_to(&self)
             .filter(archived.eq(false))
-            .select(sum(amount)).first::<Option<f64>>(&mut app_state.cpool())? {
-            Some(a) => a,
-            None => 0.0f64,
-        };
+            .select(sum(amount))
+            .load::<Option<f64>>(&mut app_state.cpool())?
+            .iter()
+            .map(|x| x.unwrap_or(0.0f64))
+            .sum();
         Ok(entry_amount_sum)
     }
 }
@@ -190,7 +196,7 @@ pub struct Currency {
     pub name: String,
     pub rate_to_fixed: f64,
     #[entity(HasDefault)]
-    archived: bool,
+    pub archived: bool,
 }
 
 impl StatefulTryFrom<CreateCurrencyRequest> for NewCurrency {
@@ -224,11 +230,7 @@ impl StatefulTryFrom<Currency> for CurrencyResponse {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self {
-            name: value.name,
-            rate_to_fixed: value.rate_to_fixed,
-            archived: value.archived,
-        })
+        Ok(Self { name: value.name, rate_to_fixed: value.rate_to_fixed, archived: value.archived })
     }
 }
 
@@ -249,7 +251,7 @@ pub struct Source {
     pub currency_id: i32,
     pub amount: f64,
     #[entity(HasDefault)]
-    archived: bool,
+    pub archived: bool,
 }
 
 impl StatefulTryFrom<CreateSourceRequest> for NewSource {
@@ -384,7 +386,7 @@ pub struct Entry {
     pub conversion_rate: Option<f64>,
     pub conversion_rate_to_fixed: f64,
     #[entity(HasDefault)]
-    archived: bool,
+    pub archived: bool,
 }
 
 impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
@@ -628,4 +630,34 @@ impl Entry {
 
         Ok(r_entries)
     }
+}
+
+pub trait HasSpecifier {
+    fn specifier() -> &'static str;
+    fn specifier_plural() -> &'static str;
+}
+
+impl HasSpecifier for User {
+    fn specifier() -> &'static str { "user" }
+    fn specifier_plural() -> &'static str { "users" }
+}
+
+impl HasSpecifier for Currency {
+    fn specifier() -> &'static str { "currency" }
+    fn specifier_plural() -> &'static str { "currencies" }
+}
+
+impl HasSpecifier for Category {
+    fn specifier() -> &'static str { "category" }
+    fn specifier_plural() -> &'static str { "categories" }
+}
+
+impl HasSpecifier for Entry {
+    fn specifier() -> &'static str { "entry" }
+    fn specifier_plural() -> &'static str { "entries" }
+}
+
+impl HasSpecifier for Source {
+    fn specifier() -> &'static str { "source" }
+    fn specifier_plural() -> &'static str { "sources" }
 }

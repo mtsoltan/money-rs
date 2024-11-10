@@ -1,3 +1,5 @@
+-- TODO: Add indices
+
 create type entry_t as enum ('spend', 'income', 'lend', 'borrow', 'convert');
 
 create table users (
