@@ -1,8 +1,6 @@
-// authentication.rs
+use std::fmt::{Display, Formatter};
+use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use crate::env_vars::jwt_secret;
-use crate::model::User;
-use crate::AppState;
 use actix_web::dev::ServiceRequest;
 use actix_web::http::StatusCode;
 use actix_web::{Error, HttpMessage, ResponseError};
@@ -10,8 +8,10 @@ use actix_web_httpauth::extractors::bearer::BearerAuth;
 use diesel::{QueryDsl as _, RunQueryDsl as _};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
-use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
+
+use crate::env_vars::jwt_secret;
+use crate::model::User;
+use crate::AppState;
 
 #[derive(Debug)]
 enum AuthenticationError {
@@ -31,29 +31,20 @@ impl Display for AuthenticationError {
 }
 
 impl ResponseError for AuthenticationError {
-    fn status_code(&self) -> StatusCode {
-        StatusCode::UNAUTHORIZED
-    }
+    fn status_code(&self) -> StatusCode { StatusCode::UNAUTHORIZED }
 }
 
 pub fn generate(user_id: i32) -> String {
     let created = SystemTime::now();
     let expires = created + Duration::new(31557600, 0);
 
-    let claims = Rfc7519Claims::try_from(LoginClaims {
-        user_id,
-        expires_at: expires,
-        created_at: created,
-    })
-    .expect("System time before unix epoch");
+    let claims =
+        Rfc7519Claims::try_from(LoginClaims { user_id, expires_at: expires, created_at: created })
+            .expect("System time before unix epoch");
 
     let header = Header::default();
-    jsonwebtoken::encode(
-        &header,
-        &claims,
-        &EncodingKey::from_secret(jwt_secret().as_ref()),
-    )
-    .expect("Encoding JWT token failed")
+    jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(jwt_secret().as_ref()))
+        .expect("Encoding JWT token failed")
 }
 
 pub fn decode(token: &str) -> Result<Rfc7519Claims, jsonwebtoken::errors::Error> {

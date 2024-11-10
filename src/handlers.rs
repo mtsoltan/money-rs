@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use ::pbkdf2::Pbkdf2;
 use actix_web::{web, HttpRequest, HttpResponse};
-use diesel::{insert_into, prelude::*};
+use diesel::insert_into;
+use diesel::prelude::*;
 use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -115,10 +116,11 @@ pub async fn create_user(
     mut data: web::Json<CreateUserRequest>,
     app_state: web::Data<AppState>,
 ) -> HttpResponse {
-    use crate::model::NewUser;
     use base64::Engine as _;
     use password_hash::Salt;
     use rand::RngCore as _;
+
+    use crate::model::NewUser;
     let created_user: Result<User, ExternalServiceError> = try {
         use crate::schema::currencies::dsl::*;
         use crate::schema::users::dsl::*;
@@ -132,10 +134,7 @@ pub async fn create_user(
         let hash = PasswordHash::generate(Pbkdf2, &data.password.as_bytes(), generated_salt)?;
 
         let user = insert_into(users)
-            .values(NewUser {
-                password: hash.to_string(),
-                username: data.username.to_string(),
-            })
+            .values(NewUser { password: hash.to_string(), username: data.username.to_string() })
             .get_result::<User>(&mut app_state.cpool())?;
         insert_into(currencies)
             .values(NewCurrency {
@@ -314,7 +313,7 @@ get_by_name_handler!(get_category_by_name, categories, Category, CategoryRespons
 
 #[derive(Debug, Deserialize)]
 pub struct BulkRequest {
-   ids: Vec<i32>,
+    ids: Vec<i32>,
 }
 
 pub async fn delete_entries(
@@ -462,7 +461,8 @@ pub async fn find_entries(
             for entry in &entries {
                 let month_year = entry.date.format("%Y-%m").to_string();
                 let category_month_key = (entry.category_id.clone(), month_year.clone());
-                *sum_per_category_per_month.entry(category_month_key).or_insert(0.0) += entry.amount;
+                *sum_per_category_per_month.entry(category_month_key).or_insert(0.0) +=
+                    entry.amount;
             }
 
             HttpResponse::Ok().json(serde_json::json!({

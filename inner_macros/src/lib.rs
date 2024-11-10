@@ -5,7 +5,8 @@ extern crate proc_macro2;
 use proc_macro2::{Ident, Span};
 use proc_macro2_diagnostics::{Diagnostic, Level};
 use quote::quote;
-use syn::{parse2, parse_quote, spanned::Spanned, DeriveInput, Expr, Type};
+use syn::spanned::Spanned;
+use syn::{parse2, parse_quote, DeriveInput, Expr, Type};
 
 fn is_option_type(ty: &Type) -> bool {
     if let Type::Path(path) = ty {
@@ -27,18 +28,37 @@ fn make_option(ty: &Type) -> Type {
 
 /// ### Details
 ///
-/// From a basic database-faithful model, this macro generates structs for create and update DTOs
-/// as well as structs for request and response DTOs.
+/// From a
+/// basic database-faithful
+/// model,
+/// this macro
+/// generates
+/// structs
+/// for
+/// create
+/// and update
+/// DTOs as
+/// well as
+/// structs
+/// for request
+/// and response
+/// DTOs.
 ///
-/// This macro generates 5 DTOs, named after the original entity. For example, for an entity named `Entry`,
-/// this macro generates:
+/// This macro generates 5 DTOs, named after the original entity. For example,
+/// for an
+/// entity
+/// named `Entry`,
+/// this macro
+/// generates:
+///
 /// - NewEntry              - Used to create an entity in the database
 /// - CreateEntryRequest    - The user-facing request DTO to create an entity
 /// - UpdateEntry           - Used to update an entity in the database
 /// - UpdateEntryRequest    - The user-facing request DTO to update an entity
 /// - EntryResponse         - The user-facing response DTO from GET APIs
 ///
-/// All you have to do is specify attributes on fields. You can specify 6 different attributes:
+/// All you have to do is specify attributes on fields. You can specify 6
+/// different attributes:
 /// - NotUpdatable
 ///   - The field is not present in database update DTO or update request DTO
 /// - NotViewable
@@ -53,7 +73,8 @@ fn make_option(ty: &Type) -> Type {
 /// - RepresentableAsString
 ///   - This field is present as a string in request and response DTOs.
 ///   - A side effect is that if the field name ends in `_id`, it is removed.
-///   - This allows user-facing requests and responses to rely on names rather than IDs for representing those fields.
+///   - This allows user-facing requests and responses to rely on names rather than IDs for
+///     representing those fields.
 ///
 /// ### Usage
 ///
@@ -62,10 +83,18 @@ fn make_option(ty: &Type) -> Type {
 /// #[entity(NotUpdatable, NotViewable, NotSettable, Id)]
 /// ```
 ///
-/// Here's an example of the usage of this macro from the project it was initially built to support:
-/// ```rust
-/// #[derive(Entity)]
-/// #[derive(Debug, Queryable, Selectable, Identifiable, Associations, Insertable, Serialize)]
+/// Here's
+/// an example
+/// of the
+/// usage of
+/// this macro
+/// from the
+/// project
+/// it was
+/// initially built to support: ```rust
+/// #[derive(
+///     Entity, Debug, Queryable, Selectable, Identifiable, Associations,
+/// Insertable, Serialize, )]
 /// #[diesel(table_name = entries)]
 /// #[diesel(belongs_to(User))]
 /// #[diesel(belongs_to(Source))]
@@ -97,7 +126,7 @@ fn make_option(ty: &Type) -> Type {
 ///     archived: bool,
 /// }
 /// ```
-///
+/// 
 /// ### Limitations:
 /// For now, this macro only works with postgres diesel connections.
 /// This macro requires the entity to also be annotated with:
@@ -154,15 +183,11 @@ fn entity_macro_internal(
         }
     };
     let new_struct_name = Ident::new(format!("New{struct_name}").as_str(), Span::call_site());
-    let create_request_struct_name = Ident::new(
-        format!("Create{struct_name}Request").as_str(),
-        Span::call_site(),
-    );
+    let create_request_struct_name =
+        Ident::new(format!("Create{struct_name}Request").as_str(), Span::call_site());
     let update_struct_name = Ident::new(format!("Update{struct_name}").as_str(), Span::call_site());
-    let update_request_struct_name = Ident::new(
-        format!("Update{struct_name}Request").as_str(),
-        Span::call_site(),
-    );
+    let update_request_struct_name =
+        Ident::new(format!("Update{struct_name}Request").as_str(), Span::call_site());
     let response_struct_name =
         Ident::new(format!("{struct_name}Response").as_str(), Span::call_site());
     let mut entity_fields = Vec::new();
@@ -186,40 +211,52 @@ fn entity_macro_internal(
                 for attr in field.attrs {
                     if attr.path().is_ident("entity") {
                         match attr.parse_nested_meta(|meta| {
-                            match meta.path.get_ident().expect("All metas inside entity should be single path").to_string().as_str() {
+                            match meta
+                                .path
+                                .get_ident()
+                                .expect("All metas inside entity should be single path")
+                                .to_string()
+                                .as_str()
+                            {
                                 "NotUpdatable" => {
                                     push_to_update = false;
                                     push_to_update_request = false;
-                                },
+                                }
                                 "NotViewable" => {
                                     push_to_response = false;
-                                },
+                                }
                                 "HasDefault" => {
                                     option_in_new = true;
-                                },
+                                }
                                 "NotSettable" => {
                                     push_to_create_request = false;
                                     push_to_update = false;
                                     push_to_update_request = false;
-                                },
+                                }
                                 "Id" => {
                                     push_to_new = false;
-                                },
+                                }
                                 "RepresentableAsString" => {
                                     representable_as_name = true;
                                 }
                                 other => {
                                     return Err(syn::Error::new(
                                         attr.span(),
-                                        format!("Unknown meta {other}. Expected a value in (NotUpdatable, NotViewable, NotSettable, Id, RepresentableAsString, HasDefault)")
+                                        format!(
+                                            "Unknown meta {other}. Expected a value in \
+                                             (NotUpdatable, NotViewable, NotSettable, Id, \
+                                             RepresentableAsString, HasDefault)"
+                                        ),
                                     ));
                                 }
                             };
 
                             Ok(())
                         }) {
-                            Ok(_) => {},
-                            Err(e) => { return Err(Diagnostic::new(Level::Error, e.to_string()));}
+                            Ok(_) => {}
+                            Err(e) => {
+                                return Err(Diagnostic::new(Level::Error, e.to_string()));
+                            }
                         };
                     }
                 }
@@ -252,17 +289,10 @@ fn entity_macro_internal(
                     response_fields.push(quote! { pub #name_ident: #name_type });
                 }
 
-                let name_type = if option_in_new {
-                    make_option(&name_type)
-                } else {
-                    name_type
-                };
+                let name_type = if option_in_new { make_option(&name_type) } else { name_type };
 
-                let new_type = if option_in_new {
-                    field_type_opt.clone()
-                } else {
-                    field_type.clone()
-                };
+                let new_type =
+                    if option_in_new { field_type_opt.clone() } else { field_type.clone() };
 
                 let name_type_opt = make_option(&name_type);
 
@@ -322,7 +352,8 @@ fn entity_macro_internal(
             #(#response_fields,)*
         }
     };
-    // return Err(Diagnostic::new(Level::Error, format!("expanded {}", expanded).as_str()));
+    // return Err(Diagnostic::new(Level::Error, format!("expanded {}",
+    // expanded).as_str()));
 
     Ok(expanded)
 }

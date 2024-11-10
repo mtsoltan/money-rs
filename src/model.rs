@@ -26,15 +26,11 @@ pub enum StatefulTryFromError {
 }
 
 impl From<diesel::result::Error> for StatefulTryFromError {
-    fn from(value: diesel::result::Error) -> Self {
-        Self::ReferencedDoesNotExist(value)
-    }
+    fn from(value: diesel::result::Error) -> Self { Self::ReferencedDoesNotExist(value) }
 }
 
 impl From<chrono::format::ParseError> for StatefulTryFromError {
-    fn from(value: chrono::format::ParseError) -> Self {
-        Self::DateTimeParseError(value)
-    }
+    fn from(value: chrono::format::ParseError) -> Self { Self::DateTimeParseError(value) }
 }
 
 pub trait GetIdByNameAndUser<N, T> {
@@ -129,12 +125,7 @@ macro_rules! get_impls {
                     None => None,
                     Some(c) => {
                         use crate::schema::$tb_name::dsl::*;
-                        Some(
-                            $tb_name
-                                .find(c)
-                                .select(name)
-                                .first(&mut app_state.cpool())?,
-                        )
+                        Some($tb_name.find(c).select(name).first(&mut app_state.cpool())?)
                     }
                 })
             }
@@ -146,10 +137,7 @@ macro_rules! get_impls {
                 app_state: Arc<AppState>,
             ) -> Result<String, diesel::result::Error> {
                 use crate::schema::$tb_name::dsl::*;
-                Ok($tb_name
-                    .find(p_id)
-                    .select(name)
-                    .first(&mut app_state.cpool())?)
+                Ok($tb_name.find(p_id).select(name).first(&mut app_state.cpool())?)
             }
         }
     };
@@ -226,11 +214,7 @@ impl StatefulTryFrom<UpdateCurrencyRequest> for UpdateCurrency {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self {
-            name: value.name,
-            rate_to_fixed: value.rate_to_fixed,
-            archived: value.archived,
-        })
+        Ok(Self { name: value.name, rate_to_fixed: value.rate_to_fixed, archived: value.archived })
     }
 }
 
@@ -344,11 +328,7 @@ impl StatefulTryFrom<CreateCategoryRequest> for NewCategory {
         user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self {
-            user_id: user.id,
-            name: value.name,
-            archived: value.archived,
-        })
+        Ok(Self { user_id: user.id, name: value.name, archived: value.archived })
     }
 }
 
@@ -358,10 +338,7 @@ impl StatefulTryFrom<UpdateCategoryRequest> for UpdateCategory {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self {
-            name: value.name,
-            archived: value.archived,
-        })
+        Ok(Self { name: value.name, archived: value.archived })
     }
 }
 
@@ -371,10 +348,7 @@ impl StatefulTryFrom<Category> for CategoryResponse {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self {
-            name: value.name,
-            archived: value.archived,
-        })
+        Ok(Self { name: value.name, archived: value.archived })
     }
 }
 
@@ -421,11 +395,8 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
     ) -> Result<Self, StatefulTryFromError> {
         let new_secondary_source_id =
             Source::get_id_by_name_and_user(value.secondary_source, &user, app_state.clone())?;
-        let new_conversion_rate = if new_secondary_source_id.is_some() {
-            value.conversion_rate
-        } else {
-            None
-        };
+        let new_conversion_rate =
+            if new_secondary_source_id.is_some() { value.conversion_rate } else { None };
         Ok(Self {
             user_id: user.id,
             description: value.description,
@@ -460,11 +431,8 @@ impl StatefulTryFrom<UpdateEntryRequest> for UpdateEntry {
     ) -> Result<Self, StatefulTryFromError> {
         let new_secondary_source_id =
             Source::get_id_by_name_and_user(value.secondary_source, &user, app_state.clone())?;
-        let new_conversion_rate = if new_secondary_source_id.is_some() {
-            value.conversion_rate
-        } else {
-            None
-        };
+        let new_conversion_rate =
+            if new_secondary_source_id.is_some() { value.conversion_rate } else { None };
         Ok(Self {
             description: value.description,
             category_id: Category::get_id_by_name_and_user(
@@ -516,7 +484,6 @@ impl StatefulTryFrom<Entry> for EntryResponse {
     }
 }
 
-
 /// - ids (IN) - for multi-select
 /// - sources (IN)
 /// - currencies (IN)
@@ -553,7 +520,11 @@ pub struct EntryQuery {
 }
 
 impl Entry {
-    pub fn find_by_filter(query_params: &EntryQuery, user: &User, app_state: Arc<AppState>) -> Result<Vec<Entry>, StatefulTryFromError> {
+    pub fn find_by_filter(
+        query_params: &EntryQuery,
+        user: &User,
+        app_state: Arc<AppState>,
+    ) -> Result<Vec<Entry>, StatefulTryFromError> {
         use crate::schema::entries::dsl::*;
         let mut query = entries.into_boxed();
 
@@ -562,26 +533,32 @@ impl Entry {
         }
 
         if let Some(names) = &query_params.sources {
-            let ids: Vec<_> = names.iter().filter_map(|name| {
-                Source::get_id_by_name_and_user(name.clone(), &user, app_state.clone())
-                    .ok()
-            }).collect();
+            let ids: Vec<_> = names
+                .iter()
+                .filter_map(|name| {
+                    Source::get_id_by_name_and_user(name.clone(), &user, app_state.clone()).ok()
+                })
+                .collect();
 
             query = query.filter(source_id.eq_any(ids));
         }
         if let Some(names) = &query_params.currencies {
-            let ids: Vec<_> = names.iter().filter_map(|name| {
-                Currency::get_id_by_name_and_user(name.clone(), &user, app_state.clone())
-                    .ok()
-            }).collect();
+            let ids: Vec<_> = names
+                .iter()
+                .filter_map(|name| {
+                    Currency::get_id_by_name_and_user(name.clone(), &user, app_state.clone()).ok()
+                })
+                .collect();
 
             query = query.filter(currency_id.eq_any(ids));
         }
         if let Some(names) = &query_params.categories {
-            let ids: Vec<_> = names.iter().filter_map(|name| {
-                Category::get_id_by_name_and_user(name.clone(), &user, app_state.clone())
-                    .ok()
-            }).collect();
+            let ids: Vec<_> = names
+                .iter()
+                .filter_map(|name| {
+                    Category::get_id_by_name_and_user(name.clone(), &user, app_state.clone()).ok()
+                })
+                .collect();
 
             query = query.filter(category_id.eq_any(ids));
         }

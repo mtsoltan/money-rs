@@ -9,7 +9,8 @@ mod schema;
 
 use actix_web::{web, App, HttpServer};
 use actix_web_httpauth::middleware::HttpAuthentication;
-use diesel::{r2d2::ConnectionManager, PgConnection};
+use diesel::r2d2::ConnectionManager;
+use diesel::PgConnection;
 use handlers::login;
 
 pub type Pool = diesel::r2d2::Pool<ConnectionManager<PgConnection>>;
@@ -24,21 +25,17 @@ impl AppState {
         self.pool.clone().get().expect("Pool should be initialized")
     }
 }
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_vars::init();
-    HttpServer::new(move || app(&pool()))
-        .bind(env_vars::bind_address())?
-        .run()
-        .await
+    HttpServer::new(move || app(&pool())).bind(env_vars::bind_address())?.run().await
 }
 
 fn pool() -> Pool {
     env_vars::init();
     let manager = ConnectionManager::<PgConnection>::new(env_vars::database_url());
-    Pool::builder()
-        .build(manager)
-        .expect("Failmed to create pool")
+    Pool::builder().build(manager).expect("Failed to create pool")
 }
 
 fn app(
@@ -46,9 +43,9 @@ fn app(
 ) -> App<
     impl actix_web::dev::ServiceFactory<
         actix_web::dev::ServiceRequest,
-        Config = (),
         Response = actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>,
         Error = actix_web::Error,
+        Config = (),
         InitError = (),
     >,
 > {
@@ -58,14 +55,14 @@ fn app(
         .route("/login", web::post().to(login))
         .service(
             web::scope("/api")
-                .wrap(HttpAuthentication::bearer(
-                    authentication::jwt_validator_generator,
-                ))
+                .wrap(HttpAuthentication::bearer(authentication::jwt_validator_generator))
                 .service(
                     web::scope("/currency")
                         .route("", web::post().to(handlers::create_currency))
                         .route("", web::get().to(handlers::get_currencies))
-                        // TODO: Also provide the monthly sums for the last 12 months, as well as that sum but normalized by conversion rates to fixed at the time of spending
+                        // TODO: Also provide the monthly sums for the last 12 months, as well as
+                        // that sum but normalized by conversion rates to
+                        // fixed at the time of spending
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
@@ -86,7 +83,9 @@ fn app(
                     web::scope("/category")
                         .route("", web::post().to(handlers::create_category))
                         .route("", web::get().to(handlers::get_categories))
-                        // TODO: Also provide the monthly sums for the last 12 months, as well as that sum but normalized by conversion rates to fixed at the time of spending
+                        // TODO: Also provide the monthly sums for the last 12 months, as well as
+                        // that sum but normalized by conversion rates to
+                        // fixed at the time of spending
                         .route("/{name}", web::get().to(handlers::get_category_by_name))
                         .route("/{name}", web::post().to(handlers::update_category))
                         .route("/{name}/archive", web::get().to(handlers::archive_category))
@@ -98,8 +97,10 @@ fn app(
                         .route("", web::post().to(handlers::create_entry))
                         // Basic get-all handler, does not return any statistics
                         .route("/all", web::get().to(handlers::get_entries))
-                        // - sort (comma separated list of values that fall in amount|source|currency|category|date|created_at|entry_type)
-                        // Returns the entries, their sum, their average per month, and their sum-per-category-per-month
+                        // - sort (comma separated list of values that fall in
+                        //   amount|source|currency|category|date|created_at|entry_type)
+                        // Returns the entries, their sum, their average per month, and their
+                        // sum-per-category-per-month
                         .route("", web::get().to(handlers::find_entries))
                         // Parameters: ids
                         .route("update", web::post().to(handlers::unimplemented))
@@ -109,11 +110,11 @@ fn app(
                 ),
         );
 
-        #[cfg(any(test, feature = "create_user"))]
-        let app = app.route("/user", web::post().to(handlers::create_user));
+    #[cfg(any(test, feature = "create_user"))]
+    let app = app.route("/user", web::post().to(handlers::create_user));
 
-        #[cfg(any(test, feature = "create_user"))]
-        let app = app.route("/user/{username}", web::delete().to(handlers::delete_user));
+    #[cfg(any(test, feature = "create_user"))]
+    let app = app.route("/user/{username}", web::delete().to(handlers::delete_user));
 
     app
 }
