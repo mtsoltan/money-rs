@@ -28,28 +28,11 @@ fn make_option(ty: &Type) -> Type {
 
 /// ### Details
 ///
-/// From a
-/// basic database-faithful
-/// model,
-/// this macro
-/// generates
-/// structs
-/// for
-/// create
-/// and update
-/// DTOs as
-/// well as
-/// structs
-/// for request
-/// and response
-/// DTOs.
+/// From a basic database-faithful model, this macro generates structs for create and update DTOs as
+/// well as structs for request and response DTOs.
 ///
-/// This macro generates 5 DTOs, named after the original entity. For example,
-/// for an
-/// entity
-/// named `Entry`,
-/// this macro
-/// generates:
+/// This macro generates 5 DTOs, named after the original entity. For example, for an entity named
+/// `Entry`, this macro generates:
 ///
 /// - NewEntry              - Used to create an entity in the database
 /// - CreateEntryRequest    - The user-facing request DTO to create an entity
@@ -57,8 +40,7 @@ fn make_option(ty: &Type) -> Type {
 /// - UpdateEntryRequest    - The user-facing request DTO to update an entity
 /// - EntryResponse         - The user-facing response DTO from GET APIs
 ///
-/// All you have to do is specify attributes on fields. You can specify 6
-/// different attributes:
+/// All you have to do is specify attributes on fields. You can specify 6 different attributes:
 /// - NotUpdatable
 ///   - The field is not present in database update DTO or update request DTO
 /// - NotViewable
@@ -79,22 +61,18 @@ fn make_option(ty: &Type) -> Type {
 /// ### Usage
 ///
 /// To specify a field as not present in any request or response, you can use:
-/// ```
-/// #[entity(NotUpdatable, NotViewable, NotSettable, Id)]
+/// ```rust
+/// #[derive(inner_macros::Entity)]
+/// pub struct SomeEntity {
+///     #[entity(NotUpdatable, NotViewable, NotSettable, Id)]
+///     pub some_field: i32,
+/// }
 /// ```
 ///
-/// Here's
-/// an example
-/// of the
-/// usage of
-/// this macro
-/// from the
-/// project
-/// it was
-/// initially built to support: ```rust
-/// #[derive(
-///     Entity, Debug, Queryable, Selectable, Identifiable, Associations,
-/// Insertable, Serialize, )]
+/// Here's an example of the usage of this macro from the project it was initially built to support:
+/// ```txt
+/// #[derive(Entity, Debug, Queryable, Selectable, Identifiable, Associations,
+/// Insertable, Serialize)]
 /// #[diesel(table_name = entries)]
 /// #[diesel(belongs_to(User))]
 /// #[diesel(belongs_to(Source))]
@@ -123,14 +101,14 @@ fn make_option(ty: &Type) -> Type {
 ///     pub conversion_rate: Option<f64>,
 ///     pub conversion_rate_to_fixed: f64,
 ///     #[entity(HasDefault)]
-///     archived: bool,
+///     pub archived: bool,
 /// }
 /// ```
-/// 
+///
 /// ### Limitations:
 /// For now, this macro only works with postgres diesel connections.
 /// This macro requires the entity to also be annotated with:
-/// ```
+/// ```txt
 /// #[diesel(table_name = ... )]
 /// ```
 #[proc_macro_derive(Entity, attributes(entity))]
