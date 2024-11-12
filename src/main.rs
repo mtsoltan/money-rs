@@ -5,6 +5,7 @@
 #![feature(stmt_expr_attributes)]
 
 mod authentication;
+mod consts;
 mod env_vars;
 mod handlers;
 mod model;
@@ -70,7 +71,7 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
-                        // TODO
+                        // TODO unimplemented
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -93,7 +94,7 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_category_by_name))
                         .route("/{name}", web::post().to(handlers::update_category))
                         .route("/{name}/archive", web::get().to(handlers::archive_category))
-                        // TODO
+                        // TODO unimplemented
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -141,8 +142,8 @@ mod tests {
     use tokio::sync::OnceCell;
 
     use super::*;
-    use crate::handlers::{CreateResponse, EmptyResponse, LoginResponse};
-    use crate::model::CurrencyResponse;
+    use crate::handlers::{EmptyResponse, LoginResponse};
+    use crate::model::{CurrencyResponse, SourceResponse};
 
     static TEST_USERNAME: &'static str = "root";
     static TEST_PASSWORD: &'static str = "root";
@@ -211,10 +212,9 @@ mod tests {
                     TestResponse {
                         status_code,
                         body_string: serde_json::to_string(&res_struct).expect(
-                            "Serializing returned error code 200 json body should always
-                succeed",
+                            "Serializing returned code 200 json body should always succeed",
                         ),
-                        body: Some(dbg!(res_struct)),
+                        body: Some(res_struct),
                     }
                 }
                 _ => {
@@ -249,14 +249,14 @@ mod tests {
             .await;
             assert!(res.status_code.is_success() || res.status_code == StatusCode::NOT_FOUND);
 
-            let res: TestResponse<CreateResponse> = run_req(
+            let res: TestResponse<EmptyResponse> = run_req(
                 &app,
                 Method::POST,
                 "/user",
                 None,
                 Some(json!({"username": TEST_USERNAME, "password": TEST_PASSWORD, "currency": TEST_CURRENCY })),
             )
-            .await;
+                .await;
             assert_response_status_is_success(&res);
 
             let res: TestResponse<LoginResponse> = run_req(
@@ -279,11 +279,8 @@ mod tests {
     fn delete_direct<T>(pool: &Pool, q: T)
     where
         T: diesel::query_builder::IntoUpdateTarget,
-        <T as diesel::associations::HasTable>::Table: diesel::query_builder::QueryId + 'static,
-        <T as diesel::query_builder::IntoUpdateTarget>::WhereClause:
-            diesel::query_builder::QueryId + diesel::query_builder::QueryFragment<diesel::pg::Pg>,
-        <<T as diesel::associations::HasTable>::Table as QuerySource>::FromClause:
-            diesel::query_builder::QueryFragment<diesel::pg::Pg>,
+        diesel::query_builder::DeleteStatement<T::Table, T::WhereClause>:
+            diesel::query_builder::QueryFragment<diesel::pg::Pg> + diesel::query_builder::QueryId,
     {
         let mut conn = pool.get().expect("Failed to get database connection");
         diesel::delete(q).execute(&mut conn).expect("Failed to run the delete query you specified");
@@ -294,23 +291,26 @@ mod tests {
 
     #[actix_web::test]
     async fn test_currency_lifecycle() {
+        // Cleanup
+        {
+            use crate::schema::currencies::dsl::*;
+            delete_direct(&pool(), currencies.filter(name.eq("EUR")));
+        }
+
+        // Get token
         let t = Some(token().await);
         let app = at::init_service(app(&pool())).await;
 
         // Create currency
-        let res: TestResponse<CreateResponse> = run_req(
+        let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 0.85, "archived": false})),
+            Some(json!({"name": "EUR", "rate_to_fixed": 0.85})),
         )
         .await;
         assert_response_status_is_success(&res);
-        assert!(
-            res.body.expect("expected body to be set on 200").id > 0,
-            "id should be greater than zero"
-        );
 
         // Get currency
         let res: TestResponse<CurrencyResponse> =
@@ -325,7 +325,7 @@ mod tests {
             Method::POST,
             "/api/currency/EUR",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 0.9, "archived": false})),
+            Some(json!({"name": "EUR", "rate_to_fixed": 0.9})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -341,27 +341,111 @@ mod tests {
         assert_response_status_is_success(&res);
         let body = res.body.expect("expected body to be set on 200");
         assert!(
-            (body.rate_to_fixed - 0.9).abs() < 1e-5f64,
+            (body.rate_to_fixed - 0.9).abs() < consts::EPSILON,
             "currency rate {} should be 0.9",
             body.rate_to_fixed
         );
         assert!(body.archived, "currency should be archived");
 
         // Attempt to create the same currency again (expect failure)
-        let res: TestResponse<CreateResponse> = run_req(
+        let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 0.85, "archived": false})),
+            Some(json!({"name": "EUR", "rate_to_fixed": 0.85})),
         )
         .await;
         assert_response_status(&res, StatusCode::BAD_REQUEST);
+    }
 
+    #[actix_web::test]
+    async fn test_source_lifecycle() {
         // Cleanup
         {
-            use crate::schema::currencies::dsl::*;
-            delete_direct(&pool(), currencies.filter(name.eq("EUR")));
+            use crate::schema::sources::dsl::*;
+            delete_direct(&pool(), sources.filter(name.eq("SavingsAccount")));
         }
+        {
+            use crate::schema::currencies::dsl::*;
+            delete_direct(&pool(), currencies.filter(name.eq("JPY")));
+        }
+
+        // Get token
+        let t = Some(token().await);
+        let app = at::init_service(app(&pool())).await;
+
+        // Create currency for the source
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::POST,
+            "/api/currency",
+            t,
+            Some(json!({"name": "JPY", "rate_to_fixed": 150.0})),
+        )
+        .await;
+        assert_response_status_is_success(&res);
+
+        // Create source
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::POST,
+            "/api/source",
+            t,
+            Some(json!({"name": "SavingsAccount", "currency": "JPY"})),
+        )
+        .await;
+        assert_response_status_is_success(&res);
+
+        // Get source
+        let res: TestResponse<SourceResponse> =
+            run_req(&app, Method::GET, "/api/source/SavingsAccount", t, None).await;
+        assert_response_status_is_success(&res);
+        let name = res.body.expect("expected body to be set on 200").name;
+        assert_eq!(name, "SavingsAccount", "source name should be 'SavingsAccount'");
+
+        // Update source
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::POST,
+            "/api/source/SavingsAccount",
+            t,
+            Some(json!({"name": "SavingsAccount", "amount": 5000})),
+        )
+        .await;
+        assert_response_status_is_success(&res);
+
+        // Archive source fails because there is amount
+        let res: TestResponse<EmptyResponse> =
+            run_req(&app, Method::GET, "/api/source/SavingsAccount/archive", t, None).await;
+        assert_response_status(&res, StatusCode::BAD_REQUEST);
+
+        // Update source to have no amount
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::POST,
+            "/api/source/SavingsAccount",
+            t,
+            Some(json!({"name": "SavingsAccount", "amount": 0})),
+        )
+        .await;
+        assert_response_status_is_success(&res);
+
+        // Archive source
+        let res: TestResponse<EmptyResponse> =
+            run_req(&app, Method::GET, "/api/source/SavingsAccount/archive", t, None).await;
+        assert_response_status_is_success(&res);
+
+        // Confirm update and archive of source
+        let res: TestResponse<SourceResponse> =
+            run_req(&app, Method::GET, "/api/source/SavingsAccount", t, None).await;
+        assert_response_status_is_success(&res);
+        let body = res.body.expect("expected body to be set on 200");
+        assert!(
+            (body.amount - 0.0).abs() < consts::EPSILON,
+            "source amount {} should be 0.0",
+            body.amount
+        );
+        assert!(body.archived, "source should be archived");
     }
 }

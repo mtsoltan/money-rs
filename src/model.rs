@@ -247,9 +247,10 @@ pub struct Source {
     #[entity(NotUpdatable, NotViewable, NotSettable)]
     pub user_id: i32,
     pub name: String,
-    #[entity(RepresentableAsString)]
+    #[entity(NotUpdatable, RepresentableAsString)]
     pub currency_id: i32,
-    pub amount: f64,
+    #[entity(HasDefault)]
+    pub amount: f64, // TODO: actually add default to table/schema
     #[entity(HasDefault)]
     pub archived: bool,
 }
@@ -268,7 +269,7 @@ impl StatefulTryFrom<CreateSourceRequest> for NewSource {
                 &user,
                 app_state.clone(),
             )?,
-            amount: 0.0f64,
+            amount: value.amount,
             archived: value.archived,
         })
     }
@@ -277,19 +278,10 @@ impl StatefulTryFrom<CreateSourceRequest> for NewSource {
 impl StatefulTryFrom<UpdateSourceRequest> for UpdateSource {
     fn stateful_try_from(
         value: UpdateSourceRequest,
-        user: &User,
-        app_state: Arc<AppState>,
+        _user: &User,
+        _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self {
-            name: value.name,
-            currency_id: Currency::get_id_by_name_and_user(
-                value.currency,
-                &user,
-                app_state.clone(),
-            )?,
-            amount: value.amount,
-            archived: value.archived,
-        })
+        Ok(Self { name: value.name, amount: value.amount, archived: value.archived })
     }
 }
 

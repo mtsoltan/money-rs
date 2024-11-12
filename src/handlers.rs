@@ -10,6 +10,7 @@ use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::consts;
 #[allow(unused_imports)]
 use crate::{
     model::{
@@ -41,6 +42,8 @@ fn internal<T: Into<String>>(debuggable: impl Debug, e: T) -> HttpResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateResponse {
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
     pub id: i32,
 }
 
@@ -54,7 +57,6 @@ pub struct CountResponse {
     pub count: usize,
 }
 
-#[allow(dead_code)]
 pub enum ExternalServiceError {
     HashError(password_hash::Error),
     DieselError(diesel::result::Error),
@@ -229,10 +231,20 @@ macro_rules! create_handler {
                 insert_into($tb_name).values(creatable).get_result::<$ent>(&mut app_state.cpool());
             match created {
                 Ok(c) => HttpResponse::Ok().json(CreateResponse { id: c.id }),
-                // TODO: Only duplicate key error should give already exists.
-                //  The other errors should throw 500
-                Err(_) => HttpResponse::BadRequest()
-                    .body(format!("{} already exists", <$ent>::specifier())),
+                Err(e) => {
+                    if matches!(
+                        e,
+                        diesel::result::Error::DatabaseError(
+                            diesel::result::DatabaseErrorKind::UniqueViolation,
+                            _
+                        )
+                    ) {
+                        HttpResponse::BadRequest()
+                            .body(format!("{} already exists", <$ent>::specifier()))
+                    } else {
+                        internal(e, format!("E014: Failed to create {}", <$ent>::specifier()))
+                    }
+                }
             }
         }
     };
@@ -317,10 +329,13 @@ macro_rules! get_by_name_handler {
                 .first(&mut app_state.cpool())
             {
                 Ok(f) => f,
-                // TODO: Only duplicate key error should give already exists.
-                //  The other errors should throw 500
-                Err(_) => {
-                    return HttpResponse::NotFound().body(format!("{} not found", $ent::specifier()))
+                Err(e) => {
+                    if matches!(e, diesel::result::Error::NotFound) {
+                        return HttpResponse::NotFound()
+                            .body(format!("{} not found", $ent::specifier()));
+                    } else {
+                        return internal(e, format!("E015: Failed to get {} by name", <$ent>::specifier()))
+                    }
                 }
             };
             let response = $resp::stateful_try_from(fetched, &user, app_state.clone());
@@ -458,7 +473,7 @@ macro_rules! archive_handler {
                 Ok(t) => t,
                 Err(e) => return internal(e, "E006: Unable to construct sum - failed to archive"),
             };
-            if net_amount != 0f64 {
+            if (net_amount - 0f64).abs() > consts::EPSILON {
                 return HttpResponse::BadRequest().body($err);
             }
             match diesel::update(&fetched).set(archived.eq(true)).execute(&mut app_state.cpool()) {
@@ -499,6 +514,8 @@ archive_handler!(
     "You cannot archive that category while it has entries. You can transfer all entries to \
      another category and then proceed."
 );
+
+// TODO: Unarchive handlers
 
 pub async fn find_entries(
     query_params: web::Query<EntryQuery>,

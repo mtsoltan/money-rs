@@ -35,7 +35,7 @@ create table sources (
     user_id int4 not null references users(id) on delete cascade,
     name varchar(1023) not null,
     currency_id int4 not null references currencies(id) on delete restrict,
-    amount float8 not null,
+    amount float8 not null default 0,
     constraint user_source unique (user_id, name),
     archived boolean not null default false
 );
