@@ -186,6 +186,9 @@ fn entity_macro_internal(
                 let mut push_to_response = true; // Also controls whether it's serialized
                 let mut representable_as_name = false;
 
+                let mut has_not_in_create = false;
+                let mut has_has_default = false;
+
                 for attr in field.attrs {
                     if attr.path().is_ident("entity") {
                         match attr.parse_nested_meta(|meta| {
@@ -204,7 +207,10 @@ fn entity_macro_internal(
                                     push_to_response = false;
                                 }
                                 "HasDefault" => {
-                                    option_in_new = true;
+                                    has_has_default = true;
+                                }
+                                "NotInCreate" => {
+                                    has_not_in_create = true;
                                 }
                                 "NotSettable" => {
                                     push_to_create_request = false;
@@ -237,6 +243,15 @@ fn entity_macro_internal(
                             }
                         };
                     }
+                }
+
+                if has_not_in_create && has_has_default {
+                    push_to_new = false;
+                    push_to_create_request = false;
+                }
+
+                if !has_not_in_create && has_has_default {
+                    option_in_new = true;
                 }
 
                 let field_type = field.ty;
@@ -301,7 +316,7 @@ fn entity_macro_internal(
     }
 
     let expanded = quote! {
-        #[derive(Insertable)]
+        #[derive(diesel::Insertable)]
         #[diesel(table_name = #table_name)]
         #[diesel(check_for_backend(diesel::pg::Pg))]
         pub struct #new_struct_name {
@@ -313,7 +328,7 @@ fn entity_macro_internal(
             #(#create_request_fields,)*
         }
 
-        #[derive(AsChangeset)]
+        #[derive(diesel::AsChangeset)]
         #[diesel(table_name = #table_name)]
         #[diesel(check_for_backend(diesel::pg::Pg))]
         pub struct #update_struct_name {

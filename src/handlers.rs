@@ -5,12 +5,12 @@ use ::pbkdf2::Pbkdf2;
 use actix_web::{web, HttpRequest, HttpResponse};
 use diesel::insert_into;
 use diesel::prelude::*;
-use log::error;
 use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::consts;
+use crate::http::{internal, ArrayQuery};
 #[allow(unused_imports)]
 use crate::{
     model::{
@@ -23,17 +23,6 @@ use crate::{
     },
     AppState,
 };
-
-/// this whole thing with string-gen could be static, since the format! only takes static args,
-/// but it's not worth the effort, so we're using Into<String> and using heap-allocated,
-/// copied-on-demand strings for this.
-fn internal<T: Into<String>>(debuggable: impl Debug, e: T) -> HttpResponse {
-    let e = e.into();
-    // TODO: Check why the error logs are not showing up in tests (and if they'll show up live)
-    error!("{}:\n{:?}", e, debuggable);
-    HttpResponse::InternalServerError().body(e)
-}
-
 // We cannot skip serialization in any of the fields in the response, as in the tests,
 // we will need to reconstruct the response from the JSON string to reason about it,
 // in order to not have to write code that uses maps.
@@ -57,17 +46,16 @@ pub struct CountResponse {
     pub count: usize,
 }
 
+#[derive(thiserror::Error, Debug)]
 pub enum ExternalServiceError {
+    #[error("Failed to generate password hash")]
     HashError(password_hash::Error),
-    DieselError(diesel::result::Error),
+    #[error("Diesel operation resulted in an error")]
+    DieselError(#[from] diesel::result::Error),
 }
 
 impl From<password_hash::Error> for ExternalServiceError {
     fn from(value: password_hash::Error) -> Self { Self::HashError(value) }
-}
-
-impl From<diesel::result::Error> for ExternalServiceError {
-    fn from(value: diesel::result::Error) -> Self { Self::DieselError(value) }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -165,7 +153,6 @@ pub async fn create_user(
                 user_id: user.id,
                 name: std::mem::take(&mut data.currency),
                 rate_to_fixed: 1.0f64,
-                archived: None,
             })
             .execute(&mut app_state.cpool())?;
 
@@ -199,13 +186,7 @@ pub async fn delete_user(
 
 impl From<StatefulTryFromError> for HttpResponse {
     fn from(error: StatefulTryFromError) -> HttpResponse {
-        match error {
-            StatefulTryFromError::ReferencedDoesNotExist(_) => HttpResponse::BadRequest()
-                .body("One of the currencies / categories / sources you referenced does not exist"),
-            StatefulTryFromError::DateTimeParseError(_) => {
-                HttpResponse::BadRequest().body("Malformed date provided - please use YYYY-MM-DD")
-            }
-        }
+        HttpResponse::BadRequest().body(error.to_string())
     }
 }
 
@@ -282,18 +263,7 @@ macro_rules! get_all_handler {
                 .collect::<Result<Vec<$resp>, _>>();
 
             match responses {
-                Err(e) => {
-                    return match e {
-                        StatefulTryFromError::ReferencedDoesNotExist(_) => {
-                            HttpResponse::BadRequest().body(
-                                "One of the currencies / categories / sources you referenced does \
-                                 not exist",
-                            )
-                        }
-                        StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest()
-                            .body("Malformed date provided - please use YYYY-MM-DD"),
-                    }
-                }
+                Err(e) => HttpResponse::from(e),
                 Ok(c) => HttpResponse::Ok().json(c),
             }
         }
@@ -334,24 +304,16 @@ macro_rules! get_by_name_handler {
                         return HttpResponse::NotFound()
                             .body(format!("{} not found", $ent::specifier()));
                     } else {
-                        return internal(e, format!("E015: Failed to get {} by name", <$ent>::specifier()))
+                        return internal(
+                            e,
+                            format!("E015: Failed to get {} by name", <$ent>::specifier()),
+                        );
                     }
                 }
             };
             let response = $resp::stateful_try_from(fetched, &user, app_state.clone());
             match response {
-                Err(e) => {
-                    return match e {
-                        StatefulTryFromError::ReferencedDoesNotExist(_) => {
-                            HttpResponse::BadRequest().body(
-                                "One of the currencies / categories / sources you referenced does \
-                                 not exist",
-                            )
-                        }
-                        StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest()
-                            .body("Malformed date provided - please use YYYY-MM-DD"),
-                    }
-                }
+                Err(e) => HttpResponse::from(e),
                 Ok(entity) => HttpResponse::Ok().json(entity),
             }
         }
@@ -368,7 +330,7 @@ pub struct BulkRequest {
 }
 
 pub async fn delete_entries(
-    web::Query(req): web::Query<BulkRequest>,
+    ArrayQuery(req): ArrayQuery<BulkRequest>,
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
@@ -384,13 +346,13 @@ pub async fn delete_entries(
 }
 
 pub async fn archive_entries(
-    web::Query(ids): web::Query<Vec<i32>>,
+    ArrayQuery(req): ArrayQuery<BulkRequest>,
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
     use crate::schema::entries::dsl::*;
     let updated_count =
-        diesel::update(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&ids)))
+        diesel::update(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&req.ids)))
             .set(archived.eq(true))
             .execute(&mut app_state.cpool());
     match updated_count {
@@ -413,18 +375,7 @@ macro_rules! update_handler {
             let path_name = path_name.into_inner();
             let data = data.into_inner();
             let change_set = match $changeset::stateful_try_from(data, &user, app_state.clone()) {
-                Err(e) => {
-                    return match e {
-                        StatefulTryFromError::ReferencedDoesNotExist(_) => {
-                            HttpResponse::BadRequest().body(
-                                "One of the currencies / categories / sources you referenced does \
-                                 not exist",
-                            )
-                        }
-                        StatefulTryFromError::DateTimeParseError(_) => HttpResponse::BadRequest()
-                            .body("Malformed date provided - please use YYYY-MM-DD"),
-                    }
-                }
+                Err(e) => return HttpResponse::from(e),
                 Ok(c) => c,
             };
             match diesel::update($ent::belonging_to(&user).filter(name.eq(&path_name)))
@@ -449,6 +400,7 @@ update_handler!(update_currency, currencies, Currency, UpdateCurrency, UpdateCur
 update_handler!(update_source, sources, Source, UpdateSource, UpdateSourceRequest);
 update_handler!(update_category, categories, Category, UpdateCategory, UpdateCategoryRequest);
 
+/// To un-archive, we update with `{ "archived": false }`
 macro_rules! archive_handler {
     ($fn_name:ident, $tb_name:ident, $ent:ident, $err:expr) => {
         pub async fn $fn_name(
@@ -491,7 +443,7 @@ macro_rules! archive_handler {
     };
 }
 
-// TODO: FE should send another GET request for sources to display:
+// TODO(15): ENDPOINT: /currency/{name}/sources - sources with balance in a country because: FE should send another GET request for sources to display:
 //  The balance exists in the following sources: <_>
 archive_handler!(
     archive_currency,
@@ -515,14 +467,11 @@ archive_handler!(
      another category and then proceed."
 );
 
-// TODO: Unarchive handlers
-
 pub async fn find_entries(
-    query_params: web::Query<EntryQuery>,
+    ArrayQuery(query_params): ArrayQuery<EntryQuery>,
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
-    let query_params = query_params.into_inner();
     let user = user.into_inner();
     let app_state = app_state.into_inner();
 
@@ -538,15 +487,15 @@ pub async fn find_entries(
             let num_months = sum_per_month.len() as f64;
             let avg_per_month = sum_amounts / num_months;
 
-            let mut sum_per_category_per_month: HashMap<(i32, String), f64> = HashMap::new();
+            let mut sum_per_category_per_month: HashMap<String, f64> = HashMap::new();
             for entry in &entries {
                 let month_year = entry.date.format("%Y-%m").to_string();
-                let category_month_key = (entry.category_id.clone(), month_year.clone());
+                let category_month_key = format!("{}|{}", entry.category_id.clone(), month_year.clone());
                 *sum_per_category_per_month.entry(category_month_key).or_insert(0.0) +=
                     entry.amount;
             }
 
-            // TODO: Replace me with a proper response struct
+            // TODO(09): STRUCTURE: Replace me with a proper response struct
             HttpResponse::Ok().json(json!({
                 "sum_per_month": sum_per_month,
                 "avg_per_month": avg_per_month,
@@ -558,7 +507,7 @@ pub async fn find_entries(
     }
 }
 
-// TODO: Work on BE of filtering, searching, bulk editing, and displaying required for FE
+// TODO(20): DESIGN: Work on BE of filtering, searching, bulk editing, and displaying required for FE
 
 /*
 Front end should allow:
@@ -581,19 +530,35 @@ Front end should allow:
 
 # Categories functionality
 - Monthly sum of entries for this category
-- TODO
+- TODO(80): DESIGN: decide the rest of categories functionality
 
 # Currencies functionality
 - Change display currency (for all of the above) - defaults to the fixed currency of the user
-- TODO
+- TODO(80): DESIGN: decide the rest of currencies functionality
 
 # Sources functionality
-- TODO
+- TODO(80): DESIGN: decide the rest of sources functionality
 
 # General front-end
 - Tables
 - Printing
 
-TODO at the very end: Look into diesel async, whcih would only require adding .await after each cpool() execute / load.
+TODO(75): STRUCTURE: at the very end: Look into diesel async, which would only require adding .await after each cpool() execute / load.
 Look into the 3 other pooling crates other than r2d2.
+
+TODO(70): EXTRA: Automatic price fetching from an online API
+TODO(70): EXTRA: Automatic tagging of entries:
+  - allow a box for amount + currency (prefix / suffix) and a dropdown for currency - locked if typed inside the box
+  - box placeholder should have currency as prefix
+  - Third input is for description, with an AI button beside it, that when tapped will try to fill all the remaining inputs from AI
+  - This input should have autocomplete from existing ones (combo box like)
+  Automatically tag:
+  - entry type - deduce from description
+  - category - deduce from description
+  - source id - deduce from description
+  - secondary source id - deduce from description
+  - date if specified in description, otherwise current date
+  - description (updated to no longer have category, date, and entry type),
+  Deduction from description works by trying to match to an existing description in database (by strict matching, or asking an LLM),
+  and if not, by asking an LLM to come up with something of its own
 */

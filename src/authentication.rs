@@ -1,4 +1,3 @@
-use std::fmt::{Display, Formatter};
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use actix_web::dev::ServiceRequest;
@@ -13,21 +12,14 @@ use crate::env_vars::jwt_secret;
 use crate::model::User;
 use crate::AppState;
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 enum AuthenticationError {
+    #[error("Token decode error: {0}")]
     TokenDecodeError(jsonwebtoken::errors::Error),
-    UserNotFound(diesel::result::Error),
+    #[error("User not found")]
+    UserNotFound(#[from] diesel::result::Error),
+    #[error("Token expired")]
     TokenExpired,
-}
-
-impl Display for AuthenticationError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AuthenticationError::TokenDecodeError(s) => s.fmt(f),
-            AuthenticationError::UserNotFound(_s) => "User not found".fmt(f),
-            AuthenticationError::TokenExpired => "Token expired".fmt(f),
-        }
-    }
 }
 
 impl ResponseError for AuthenticationError {

@@ -1,14 +1,17 @@
 use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime};
-use diesel::*;
-use inner_macros::Entity;
 use serde::{Deserialize, Serialize};
 
 // Needed by macros
-use crate::schema::sql_types::EntryT;
-use crate::schema::*;
-use crate::AppState;
+#[rustfmt::skip]
+use {
+    diesel::*, // Used by `inner_macros::Entity`
+    crate::schema::*,
+    crate::schema::sql_types::EntryT, // Used by `diesel_derive_enum::DbEnum`
+    crate::AppState,
+    inner_macros::Entity // The `inner_macros::Entity` derivable macro itself
+};
 
 #[derive(Debug, PartialEq, Clone, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
 #[ExistingTypePath = "EntryT"]
@@ -20,18 +23,12 @@ pub enum EntryType {
     Convert,
 }
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum StatefulTryFromError {
-    ReferencedDoesNotExist(diesel::result::Error),
-    DateTimeParseError(chrono::format::ParseError),
-}
-
-impl From<diesel::result::Error> for StatefulTryFromError {
-    fn from(value: diesel::result::Error) -> Self { Self::ReferencedDoesNotExist(value) }
-}
-
-impl From<chrono::format::ParseError> for StatefulTryFromError {
-    fn from(value: chrono::format::ParseError) -> Self { Self::DateTimeParseError(value) }
+    #[error("One of the currencies / categories / sources you referenced does not exist")]
+    ReferencedDoesNotExist(#[from] diesel::result::Error),
+    #[error("Malformed date provided - please use YYYY-MM-DD")]
+    DateTimeParseError(#[from] chrono::format::ParseError),
 }
 
 pub trait GetIdByNameAndUser<N, T> {
@@ -195,7 +192,7 @@ pub struct Currency {
     pub user_id: i32,
     pub name: String,
     pub rate_to_fixed: f64,
-    #[entity(HasDefault)]
+    #[entity(HasDefault, NotInCreate)]
     pub archived: bool,
 }
 
@@ -205,12 +202,7 @@ impl StatefulTryFrom<CreateCurrencyRequest> for NewCurrency {
         user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self {
-            user_id: user.id,
-            name: value.name,
-            rate_to_fixed: value.rate_to_fixed,
-            archived: value.archived,
-        })
+        Ok(Self { user_id: user.id, name: value.name, rate_to_fixed: value.rate_to_fixed })
     }
 }
 
@@ -250,7 +242,7 @@ pub struct Source {
     #[entity(NotUpdatable, RepresentableAsString)]
     pub currency_id: i32,
     #[entity(HasDefault)]
-    pub amount: f64, // TODO: actually add default to table/schema
+    pub amount: f64,
     #[entity(HasDefault)]
     pub archived: bool,
 }
@@ -360,7 +352,12 @@ pub struct Entry {
     pub id: i32,
     #[entity(NotUpdatable, NotViewable, NotSettable)]
     pub user_id: i32,
+    /// User-entered description, we can match this to previously entered descriptions and try to
+    /// decide values for other fields.
     pub description: String,
+    /// For grouping lending and borrowing. Should be set only when entry_type is EntryType::Borrow
+    /// or EntryType::Lend
+    pub target: Option<String>,
     #[entity(RepresentableAsString)]
     pub category_id: i32,
     pub amount: f64,
@@ -373,11 +370,21 @@ pub struct Entry {
     pub entry_type: EntryType,
     #[entity(RepresentableAsString)]
     pub source_id: i32,
+    /// Only for entry_type of EntryType::Convert, as it converts money from one currency to
+    /// another, for two provided sources of different currencies. The source `from` is source_id,
+    /// while the source `to` is secondary_source_id.
     #[entity(RepresentableAsString)]
     pub secondary_source_id: Option<i32>,
+    /// Conversion rates for currencies may change, so we store the conversion rate at which this
+    /// entry took place inside the entry itself, to keep track of how much it was worth at the
+    /// time. This is only present for entries of type EntryType::Convert.
+    /// If not present, it uses the value from currency.
     pub conversion_rate: Option<f64>,
+    /// This is fetched from the currency itself for anything but those of type Entry::Convert,
+    /// in which case it faithfully follows conversion_rate if specified.
+    #[entity(NotInCreate)]
     pub conversion_rate_to_fixed: f64,
-    #[entity(HasDefault)]
+    #[entity(HasDefault, NotInCreate)]
     pub archived: bool,
 }
 
@@ -389,11 +396,13 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
     ) -> Result<Self, StatefulTryFromError> {
         let new_secondary_source_id =
             Source::get_id_by_name_and_user(value.secondary_source, &user, app_state.clone())?;
+        // TODO(10): BUG: Fix conversion rate calculations to adhere to docs
         let new_conversion_rate =
             if new_secondary_source_id.is_some() { value.conversion_rate } else { None };
         Ok(Self {
             user_id: user.id,
             description: value.description,
+            target: value.target,
             category_id: Category::get_id_by_name_and_user(
                 value.category,
                 &user,
@@ -412,7 +421,6 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
             secondary_source_id: new_secondary_source_id,
             conversion_rate: new_conversion_rate,
             conversion_rate_to_fixed: value.conversion_rate_to_fixed,
-            archived: value.archived,
         })
     }
 }
@@ -429,6 +437,7 @@ impl StatefulTryFrom<UpdateEntryRequest> for UpdateEntry {
             if new_secondary_source_id.is_some() { value.conversion_rate } else { None };
         Ok(Self {
             description: value.description,
+            target: value.target,
             category_id: Category::get_id_by_name_and_user(
                 value.category,
                 &user,
@@ -460,13 +469,15 @@ impl StatefulTryFrom<Entry> for EntryResponse {
         _user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
+        let value = value;
         Ok(Self {
             id: value.id,
             description: value.description,
+            target: value.target,
             category: Category::get_name_by_id(value.category_id, app_state.clone())?,
             amount: value.amount,
             date: value.date.format("%F").to_string(),
-            created_at: value.created_at.format("%+").to_string(),
+            created_at: value.created_at.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
             currency: Currency::get_name_by_id(value.currency_id, app_state.clone())?,
             entry_type: value.entry_type,
             source: Source::get_name_by_id(value.source_id, app_state.clone())?,

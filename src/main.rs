@@ -8,6 +8,7 @@ mod authentication;
 mod consts;
 mod env_vars;
 mod handlers;
+mod http;
 mod model;
 mod schema;
 
@@ -65,13 +66,13 @@ fn app(
                     web::scope("/currency")
                         .route("", web::post().to(handlers::create_currency))
                         .route("", web::get().to(handlers::get_currencies))
-                        // TODO: Also provide the monthly sums for the last 12 months, as well as
+                        // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as well as
                         // that sum but normalized by conversion rates to
                         // fixed at the time of spending
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
-                        // TODO unimplemented
+                        // TODO(15): ENDPOINT: unimplemented
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -81,20 +82,20 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_source_by_name))
                         .route("/{name}", web::post().to(handlers::update_source))
                         .route("/{name}/archive", web::get().to(handlers::archive_source))
-                        // TODO Entries that have this as source 1 or source 2
+                        // TODO(15): ENDPOINT: Entries that have this as source 1 or source 2
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
                     web::scope("/category")
                         .route("", web::post().to(handlers::create_category))
                         .route("", web::get().to(handlers::get_categories))
-                        // TODO: Also provide the monthly sums for the last 12 months, as well as
+                        // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as well as
                         // that sum but normalized by conversion rates to
                         // fixed at the time of spending
                         .route("/{name}", web::get().to(handlers::get_category_by_name))
                         .route("/{name}", web::post().to(handlers::update_category))
                         .route("/{name}/archive", web::get().to(handlers::archive_category))
-                        // TODO unimplemented
+                        // TODO(15): ENDPOINT: unimplemented
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -108,7 +109,7 @@ fn app(
                         // sum-per-category-per-month
                         .route("", web::get().to(handlers::find_entries))
                         // Parameters: ids
-                        .route("update", web::post().to(handlers::unimplemented))
+                        .route("/update", web::post().to(handlers::unimplemented))
                         // Parameters: ids
                         .route("", web::delete().to(handlers::delete_entries))
                         .route("/archive", web::get().to(handlers::archive_entries)),
@@ -143,7 +144,7 @@ mod tests {
 
     use super::*;
     use crate::handlers::{EmptyResponse, LoginResponse};
-    use crate::model::{CurrencyResponse, SourceResponse};
+    use crate::model::{CategoryResponse, CurrencyResponse, EntryResponse, SourceResponse};
 
     static TEST_USERNAME: &'static str = "root";
     static TEST_PASSWORD: &'static str = "root";
@@ -307,7 +308,7 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 0.85})),
+            Some(json!({"name": "EUR", "rate_to_fixed": 1.01})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -325,7 +326,7 @@ mod tests {
             Method::POST,
             "/api/currency/EUR",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 0.9})),
+            Some(json!({"name": "EUR", "rate_to_fixed": 1.06})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -341,8 +342,8 @@ mod tests {
         assert_response_status_is_success(&res);
         let body = res.body.expect("expected body to be set on 200");
         assert!(
-            (body.rate_to_fixed - 0.9).abs() < consts::EPSILON,
-            "currency rate {} should be 0.9",
+            (body.rate_to_fixed - 1.06).abs() < consts::EPSILON,
+            "currency rate {} should be 1.06",
             body.rate_to_fixed
         );
         assert!(body.archived, "currency should be archived");
@@ -353,7 +354,7 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 0.85})),
+            Some(json!({"name": "EUR", "rate_to_fixed": 0.9})),
         )
         .await;
         assert_response_status(&res, StatusCode::BAD_REQUEST);
@@ -368,7 +369,7 @@ mod tests {
         }
         {
             use crate::schema::currencies::dsl::*;
-            delete_direct(&pool(), currencies.filter(name.eq("JPY")));
+            delete_direct(&pool(), currencies.filter(name.eq("GBP")));
         }
 
         // Get token
@@ -381,7 +382,7 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "JPY", "rate_to_fixed": 150.0})),
+            Some(json!({"name": "GBP", "rate_to_fixed": 1.28})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -392,7 +393,7 @@ mod tests {
             Method::POST,
             "/api/source",
             t,
-            Some(json!({"name": "SavingsAccount", "currency": "JPY"})),
+            Some(json!({"name": "SavingsAccount", "currency": "GBP"})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -447,5 +448,246 @@ mod tests {
             body.amount
         );
         assert!(body.archived, "source should be archived");
+    }
+
+    #[actix_web::test]
+    async fn test_category_lifecycle() {
+        // Cleanup
+        {
+            use crate::schema::categories::dsl::*;
+            delete_direct(&pool(), categories.filter(name.eq("RentAndBillsT")));
+            delete_direct(&pool(), categories.filter(name.eq("RecurringExpensesT")));
+        }
+
+        // Get token
+        let t = Some(token().await);
+        let app = at::init_service(app(&pool())).await;
+
+        // Create category
+        let res: TestResponse<EmptyResponse> =
+            run_req(&app, Method::POST, "/api/category", t, Some(json!({"name": "RentAndBillsT"})))
+                .await;
+        assert_response_status_is_success(&res);
+
+        // Get category
+        let res: TestResponse<CategoryResponse> =
+            run_req(&app, Method::GET, "/api/category/RentAndBillsT", t, None).await;
+        assert_response_status_is_success(&res);
+        let name = res.body.expect("expected body to be set on 200").name;
+        assert_eq!(name, "RentAndBillsT", "category name should be 'RentAndBillsT'");
+
+        // Update category name
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::POST,
+            "/api/category/RentAndBillsT",
+            t,
+            Some(json!({"name": "RecurringExpensesT"})),
+        )
+        .await;
+        assert_response_status_is_success(&res);
+
+        // Archive category
+        let res: TestResponse<EmptyResponse> =
+            run_req(&app, Method::GET, "/api/category/RecurringExpensesT/archive", t, None).await;
+        assert_response_status_is_success(&res);
+
+        // Confirm update and archive of category by fetching with new name
+        let res: TestResponse<CategoryResponse> =
+            run_req(&app, Method::GET, "/api/category/RecurringExpensesT", t, None).await;
+        assert_response_status_is_success(&res);
+        let body = res.body.expect("expected body to be set on 200");
+        assert_eq!(body.name, "RecurringExpensesT", "category name should be 'RecurringExpensesT'");
+        assert!(body.archived, "category should be archived");
+    }
+
+    #[actix_web::test]
+    async fn test_entries_lifecycle() {
+        // Cleanup: Delete currencies, categories, sources, and entries if they already exist
+        {
+            use crate::schema::entries::dsl::*;
+
+            delete_direct(&pool(), entries);
+        }
+        {
+            use crate::schema::categories::dsl::*;
+
+            delete_direct(&pool(), categories.filter(name.eq("RecurringExpenses")));
+            delete_direct(&pool(), categories.filter(name.eq("LivingExpenses")));
+            delete_direct(&pool(), categories.filter(name.eq("Purchases")));
+            delete_direct(&pool(), categories.filter(name.eq("Entertainment")));
+        }
+        {
+            use crate::schema::sources::dsl::*;
+            delete_direct(&pool(), sources.filter(name.eq("USDBankAccount")));
+            delete_direct(&pool(), sources.filter(name.eq("USDWallet")));
+            delete_direct(&pool(), sources.filter(name.eq("EGPBankAccount")));
+            delete_direct(&pool(), sources.filter(name.eq("EGPWallet")));
+            delete_direct(&pool(), sources.filter(name.eq("JPYBankAccount")));
+            delete_direct(&pool(), sources.filter(name.eq("JPYWallet")));
+        }
+        {
+            use crate::schema::currencies::dsl::*;
+            delete_direct(&pool(), currencies.filter(name.eq("EGP")));
+            delete_direct(&pool(), currencies.filter(name.eq("JPY")));
+        }
+
+        // Get token and app service
+        let t = Some(token().await);
+        let app = at::init_service(app(&pool())).await;
+
+        // 1. Create Currencies: EGP and JPY
+        let currencies = vec!["EGP", "JPY"];
+        for &currency in &currencies {
+            let res: TestResponse<EmptyResponse> = run_req(
+                &app,
+                Method::POST,
+                "/api/currency",
+                t,
+                Some(json!({ "name": currency, "rate_to_fixed": 1.0 })),
+            )
+            .await;
+            assert_response_status_is_success(&res);
+        }
+
+        // 2. Create Categories: RecurringExpenses, LivingExpenses, Purchases, Entertainment
+        let categories = vec!["RecurringExpenses", "LivingExpenses", "Purchases", "Entertainment"];
+        for &category in &categories {
+            let res: TestResponse<EmptyResponse> =
+                run_req(&app, Method::POST, "/api/category", t, Some(json!({ "name": category })))
+                    .await;
+            assert_response_status_is_success(&res);
+        }
+
+        // 3. Create Sources for each currency (USD, EGP, JPY)
+        let source_data = vec![
+            ("USDBankAccount", "USD"),
+            ("USDWallet", "USD"),
+            ("EGPBankAccount", "EGP"),
+            ("EGPWallet", "EGP"),
+            ("JPYBankAccount", "JPY"),
+            ("JPYWallet", "JPY"),
+        ];
+        for &(source, currency) in &source_data {
+            let res: TestResponse<EmptyResponse> = run_req(
+                &app,
+                Method::POST,
+                "/api/source",
+                t,
+                Some(json!({ "name": source, "currency": currency })),
+            )
+            .await;
+            assert_response_status_is_success(&res);
+        }
+
+        // 4. Create 20 Entries with varying types and attributes
+        let entries_data = vec![
+            ("Spend", 100.0, "USDBankAccount", None, "LivingExpenses", "2023-01-01"),
+            ("Income", 200.0, "USDWallet", None, "RecurringExpenses", "2023-02-01"),
+            ("Lend", 50.0, "USDBankAccount", Some("John Doe"), "Purchases", "2023-03-01"),
+            ("Borrow", 75.0, "USDWallet", Some("Jane Doe"), "Entertainment", "2023-04-01"),
+            ("Convert", 500.0, "USDBankAccount", Some("USDWallet"), "LivingExpenses", "2023-05-01"),
+            ("Spend", 120.0, "EGPBankAccount", None, "Purchases", "2023-06-01"),
+            ("Income", 130.0, "EGPWallet", None, "LivingExpenses", "2023-07-01"),
+            ("Lend", 80.0, "JPYBankAccount", Some("Friend"), "Entertainment", "2023-08-01"),
+            ("Borrow", 90.0, "JPYWallet", Some("Colleague"), "RecurringExpenses", "2023-09-01"),
+            ("Convert", 200.0, "EGPWallet", Some("EGPBankAccount"), "Purchases", "2023-10-01"),
+            ("Spend", 110.0, "USDWallet", None, "LivingExpenses", "2023-11-01"),
+            ("Income", 115.0, "JPYBankAccount", None, "Entertainment", "2023-12-01"),
+            ("Lend", 85.0, "USDWallet", Some("Neighbor"), "Purchases", "2024-01-01"),
+            ("Borrow", 65.0, "USDBankAccount", Some("Relative"), "Entertainment", "2024-02-01"),
+            ("Convert", 400.0, "USDWallet", Some("USDWallet"), "RecurringExpenses", "2024-03-01"),
+            ("Spend", 90.0, "JPYBankAccount", None, "Entertainment", "2024-04-01"),
+            ("Income", 200.0, "JPYWallet", None, "RecurringExpenses", "2024-05-01"),
+            ("Lend", 75.0, "EGPBankAccount", Some("Associate"), "LivingExpenses", "2024-06-01"),
+            ("Borrow", 85.0, "EGPWallet", Some("Partner"), "Purchases", "2024-07-01"),
+            ("Convert", 500.0, "JPYWallet", Some("JPYBankAccount"), "Entertainment", "2024-08-01"),
+        ];
+
+        for (entry_type, amount, source, target, category, date) in entries_data {
+            let res: TestResponse<EmptyResponse> = run_req(
+                &app,
+                Method::POST,
+                "/api/entry",
+                t,
+                Some(json!({
+                    "entry_type": entry_type,
+                    "amount": amount,
+                    "source": source,
+                    "target": target,
+                    "category": category,
+                    "description": "Sample Entry",
+                    "date": date,
+                    "currency": "USD", // TODO(10): BUG: Should auto-convert if creating a USD entry from an EGP source
+                    "conversion_rate_to_fixed": 1.00,
+                    "conversion_rate": 1.00 // TODO(10): STRUCTURE: this and conversion_rate_to_fixed should not be provided in requests
+                })),
+            )
+            .await;
+            assert_response_status_is_success(&res);
+        }
+
+        // 5. Get all entries and ensure the count is 20
+        let res: TestResponse<Vec<EntryResponse>> =
+            run_req(&app, Method::GET, "/api/entry/all", t, None).await;
+        assert_response_status_is_success(&res);
+        let all_entries = res.body.expect("Expected entries in response");
+        assert_eq!(all_entries.len(), 20, "Expected 20 entries initially");
+
+        // 6. Archive 2 entries and delete 2 entries
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::GET,
+            &format!("/api/entry/archive?ids[]={}&ids[]={}", all_entries[0].id, all_entries[1].id),
+            t,
+            None,
+        )
+        .await;
+        assert_response_status_is_success(&res);
+
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::DELETE,
+            &format!("/api/entry?ids[]={}&ids[]={}", all_entries[2].id, all_entries[3].id),
+            t,
+            None,
+        )
+        .await;
+        assert_response_status_is_success(&res);
+
+        // 7. Ensure count is now 18 and 2 archived entries
+        let res: TestResponse<Vec<EntryResponse>> =
+            run_req(&app, Method::GET, "/api/entry/all", t, None).await;
+        assert_response_status_is_success(&res);
+        let body = res.body.expect("Expected entries in response");
+        assert_eq!(body.len(), 18, "Expected 18 entries after deletion");
+        assert_eq!(body.iter().filter(|o| o.archived).count(), 2, "Expected 2 archived entries");
+
+        // 8. Use find entries with different filters and verify results
+        let filters = vec![
+            (Some(100.0), None, None, 3), // Find entries with amount 100.0
+            (None, Some(80.0), None, 5),  // Find entries with min amount 80.0
+            (None, None, Some(120.0), 7), // Find entries with max amount 120.0
+            (None, None, None, 20),       // Find all entries
+        ];
+
+        for (amount, min_amount, max_amount, expected_count) in filters {
+            let mut filter = json!({});
+            if let Some(amount) = amount {
+                filter["amount"] = json!(amount);
+            }
+            if let Some(min) = min_amount {
+                filter["min_amount"] = json!(min);
+            }
+            if let Some(max) = max_amount {
+                filter["max_amount"] = json!(max);
+            }
+
+            let res: TestResponse<Vec<EntryResponse>> =
+                run_req(&app, Method::GET, "/api/entry", t, Some(filter)).await;
+            assert_response_status_is_success(&res);
+            let filtered_entries = res.body.expect("Expected filtered entries");
+            assert_eq!(filtered_entries.len(), expected_count, "Unexpected entry count for filter");
+        }
     }
 }

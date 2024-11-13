@@ -10,7 +10,7 @@ diesel::table! {
     categories (id) {
         id -> Int4,
         user_id -> Int4,
-        #[max_length = 1023]
+        #[max_length = 127]
         name -> Varchar,
         archived -> Bool,
     }
@@ -20,7 +20,7 @@ diesel::table! {
     currencies (id) {
         id -> Int4,
         user_id -> Int4,
-        #[max_length = 1023]
+        #[max_length = 63]
         name -> Varchar,
         rate_to_fixed -> Float8,
         archived -> Bool,
@@ -35,6 +35,8 @@ diesel::table! {
         id -> Int4,
         user_id -> Int4,
         description -> Text,
+        #[max_length = 127]
+        target -> Nullable<Varchar>,
         category_id -> Int4,
         amount -> Float8,
         date -> Timestamp,
@@ -53,7 +55,7 @@ diesel::table! {
     sources (id) {
         id -> Int4,
         user_id -> Int4,
-        #[max_length = 1023]
+        #[max_length = 127]
         name -> Varchar,
         currency_id -> Int4,
         amount -> Float8,
@@ -64,7 +66,7 @@ diesel::table! {
 diesel::table! {
     users (id) {
         id -> Int4,
-        #[max_length = 1023]
+        #[max_length = 63]
         username -> Varchar,
         #[max_length = 1023]
         password -> Varchar,
