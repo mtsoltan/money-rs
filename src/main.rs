@@ -66,9 +66,9 @@ fn app(
                     web::scope("/currency")
                         .route("", web::post().to(handlers::create_currency))
                         .route("", web::get().to(handlers::get_currencies))
-                        // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as well as
-                        // that sum but normalized by conversion rates to
-                        // fixed at the time of spending
+                        // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as
+                        //  well as that sum but normalized by conversion rates to fixed at the time
+                        //  of spending
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
@@ -89,9 +89,9 @@ fn app(
                     web::scope("/category")
                         .route("", web::post().to(handlers::create_category))
                         .route("", web::get().to(handlers::get_categories))
-                        // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as well as
-                        // that sum but normalized by conversion rates to
-                        // fixed at the time of spending
+                        // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as
+                        //  well as that sum but normalized by conversion rates to fixed at the time
+                        //  of spending
                         .route("/{name}", web::get().to(handlers::get_category_by_name))
                         .route("/{name}", web::post().to(handlers::update_category))
                         .route("/{name}/archive", web::get().to(handlers::archive_category))

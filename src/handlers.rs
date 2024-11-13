@@ -443,8 +443,9 @@ macro_rules! archive_handler {
     };
 }
 
-// TODO(15): ENDPOINT: /currency/{name}/sources - sources with balance in a country because: FE should send another GET request for sources to display:
-//  The balance exists in the following sources: <_>
+// TODO(15): ENDPOINT: /currency/{name}/sources - sources with balance in a country because: FE
+//  should send another GET request for sources to display:  The balance exists in the following
+//  sources: <_>
 archive_handler!(
     archive_currency,
     currencies,
@@ -490,7 +491,8 @@ pub async fn find_entries(
             let mut sum_per_category_per_month: HashMap<String, f64> = HashMap::new();
             for entry in &entries {
                 let month_year = entry.date.format("%Y-%m").to_string();
-                let category_month_key = format!("{}|{}", entry.category_id.clone(), month_year.clone());
+                let category_month_key =
+                    format!("{}|{}", entry.category_id.clone(), month_year.clone());
                 *sum_per_category_per_month.entry(category_month_key).or_insert(0.0) +=
                     entry.amount;
             }
@@ -507,7 +509,8 @@ pub async fn find_entries(
     }
 }
 
-// TODO(20): DESIGN: Work on BE of filtering, searching, bulk editing, and displaying required for FE
+// TODO(20): DESIGN: Work on BE of filtering, searching, bulk editing, and displaying required for
+//  FE
 
 /*
 Front end should allow:
