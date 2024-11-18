@@ -83,6 +83,7 @@ fn app(
                         .route("/{name}", web::post().to(handlers::update_source))
                         .route("/{name}/archive", web::get().to(handlers::archive_source))
                         // TODO(15): ENDPOINT: Entries that have this as source 1 or source 2
+                        //  (?primary_only should be possible in request)
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -109,6 +110,7 @@ fn app(
                         // sum-per-category-per-month
                         .route("", web::get().to(handlers::find_entries))
                         // Parameters: ids
+                        // TODO(12): ENDPOINT: unimplemented
                         .route("/update", web::post().to(handlers::unimplemented))
                         // Parameters: ids
                         .route("", web::delete().to(handlers::delete_entries))
@@ -143,8 +145,10 @@ mod tests {
     use tokio::sync::OnceCell;
 
     use super::*;
-    use crate::handlers::{EmptyResponse, LoginResponse};
-    use crate::model::{CategoryResponse, CurrencyResponse, EntryResponse, SourceResponse};
+    use crate::handlers::{EmptyResponse, FindEntriesResponse, LoginResponse};
+    use crate::model::{
+        CategoryResponse, CurrencyResponse, EntryQuery, EntryResponse, SourceResponse,
+    };
 
     static TEST_USERNAME: &'static str = "root";
     static TEST_PASSWORD: &'static str = "root";
@@ -580,8 +584,37 @@ mod tests {
             assert_response_status_is_success(&res);
         }
 
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::POST,
+            "/api/entry",
+            t,
+            Some(json!({
+                    "entry_type": "Convert",
+                    "amount": 500.0,
+                    "source": "JPYWallet",
+                    "target": Some("Relative"),
+                    "category": "LivingExpenses",
+                    "description": "Sample Entry",
+                    "date": "2023-05-01",
+                    "currency": "USD",
+                    "conversion_rate_to_fixed": 1.00,
+                    "conversion_rate": 1.00
+                })),
+        )
+            .await;
+        // Converts without second source should throw bad request
+        assert_response_status(&res, StatusCode::BAD_REQUEST);
+
         // 4. Create 20 Entries with varying types and attributes
         let entries_data = vec![
+            ("Borrow", 65.0, "USDBankAccount", Some("Relative"), "Entertainment", "2023-02-01"),
+            ("Convert", 400.0, "USDWallet", Some("USDWallet"), "RecurringExpenses", "2023-03-01"),
+            ("Spend", 90.0, "JPYBankAccount", None, "Entertainment", "2023-04-01"),
+            ("Income", 200.0, "JPYWallet", None, "RecurringExpenses", "2023-05-01"),
+            ("Lend", 75.0, "EGPBankAccount", Some("Associate"), "LivingExpenses", "2023-06-01"),
+            ("Borrow", 85.0, "EGPWallet", Some("Partner"), "Purchases", "2023-07-01"),
+            ("Convert", 500.0, "JPYWallet", Some("JPYBankAccount"), "Entertainment", "2023-08-01"), // TODO(5): Fix us...
             ("Spend", 100.0, "USDBankAccount", None, "LivingExpenses", "2023-01-01"),
             ("Income", 200.0, "USDWallet", None, "RecurringExpenses", "2023-02-01"),
             ("Lend", 50.0, "USDBankAccount", Some("John Doe"), "Purchases", "2023-03-01"),
@@ -595,13 +628,6 @@ mod tests {
             ("Spend", 110.0, "USDWallet", None, "LivingExpenses", "2023-11-01"),
             ("Income", 115.0, "JPYBankAccount", None, "Entertainment", "2023-12-01"),
             ("Lend", 85.0, "USDWallet", Some("Neighbor"), "Purchases", "2024-01-01"),
-            ("Borrow", 65.0, "USDBankAccount", Some("Relative"), "Entertainment", "2024-02-01"),
-            ("Convert", 400.0, "USDWallet", Some("USDWallet"), "RecurringExpenses", "2024-03-01"),
-            ("Spend", 90.0, "JPYBankAccount", None, "Entertainment", "2024-04-01"),
-            ("Income", 200.0, "JPYWallet", None, "RecurringExpenses", "2024-05-01"),
-            ("Lend", 75.0, "EGPBankAccount", Some("Associate"), "LivingExpenses", "2024-06-01"),
-            ("Borrow", 85.0, "EGPWallet", Some("Partner"), "Purchases", "2024-07-01"),
-            ("Convert", 500.0, "JPYWallet", Some("JPYBankAccount"), "Entertainment", "2024-08-01"),
         ];
 
         for (entry_type, amount, source, target, category, date) in entries_data {
@@ -618,9 +644,9 @@ mod tests {
                     "category": category,
                     "description": "Sample Entry",
                     "date": date,
-                    "currency": "USD", // TODO(10): BUG: Should auto-convert if creating a USD entry from an EGP source
+                    "currency": "USD", // TODO(5): BUG: Should auto-convert if creating a USD entry from an EGP source - this is fixed, it just needs to be tested
                     "conversion_rate_to_fixed": 1.00,
-                    "conversion_rate": 1.00 // TODO(10): STRUCTURE: this and conversion_rate_to_fixed should not be provided in requests
+                    "conversion_rate": 1.00 // TODO(5): STRUCTURE: this and conversion_rate_to_fixed should not be provided in requests - this is fixed it just needs to be tested
                 })),
             )
             .await;
@@ -664,30 +690,45 @@ mod tests {
         assert_eq!(body.iter().filter(|o| o.archived).count(), 2, "Expected 2 archived entries");
 
         // 8. Use find entries with different filters and verify results
+        #[rustfmt::skip]
         let filters = vec![
-            (Some(100.0), None, None, 3), // Find entries with amount 100.0
-            (None, Some(80.0), None, 5),  // Find entries with min amount 80.0
-            (None, None, Some(120.0), 7), // Find entries with max amount 120.0
-            (None, None, None, 20),       // Find all entries
+            (EntryQuery { amount: Some(90.0), ..Default::default() }, 2),
+            (EntryQuery { min_amount: Some(80.0), ..Default::default() }, 16),
+            (EntryQuery { max_amount: Some(120.0), ..Default::default() }, 13),
+            (EntryQuery { currencies: Some(vec!["EGP".to_string()]), ..Default::default() }, 5),
+            (EntryQuery { sources: Some(vec!["JPYBankAccount".to_string()]), ..Default::default()}, 3),
         ];
+        let filters_qs =
+            filters.into_iter().map(|o| (serde_qs::to_string::<EntryQuery>(&o.0), o.1));
 
-        for (amount, min_amount, max_amount, expected_count) in filters {
-            let mut filter = json!({});
-            if let Some(amount) = amount {
-                filter["amount"] = json!(amount);
-            }
-            if let Some(min) = min_amount {
-                filter["min_amount"] = json!(min);
-            }
-            if let Some(max) = max_amount {
-                filter["max_amount"] = json!(max);
-            }
-
-            let res: TestResponse<Vec<EntryResponse>> =
-                run_req(&app, Method::GET, "/api/entry", t, Some(filter)).await;
+        for (filter, expected_count) in filters_qs {
+            let filter = filter.expect("Filter should always succeed in serializing");
+            let res: TestResponse<FindEntriesResponse> =
+                run_req(&app, Method::GET, format!("/api/entry?{filter}").as_str(), t, None).await;
             assert_response_status_is_success(&res);
             let filtered_entries = res.body.expect("Expected filtered entries");
-            assert_eq!(filtered_entries.len(), expected_count, "Unexpected entry count for filter");
+            dbg!(json!(filtered_entries));
+            assert_eq!(
+                filtered_entries.entries.len(),
+                expected_count,
+                "Unexpected entry count {} for filter {} - expected {}",
+                filtered_entries.entries.len(),
+                filter,
+                expected_count
+            );
         }
+
+        // TODO(30): TEST: More filters, auto-convert from source if another currency specified,
+        //  bulk delete entries (should also assert returns money to sources).
+        // TODO(40): TEST: Test newly implemented endpoints:
+        //  - Get currency's entries
+        //  - Get source's entries
+        //  - Get category's entries
+        //  - ^ those three should allow ?page (0-based) and ?page_size
+        //  - neither specified defaults to returning 500 entries
+        //  - page specified -> page_size defaults to returning 100
+        //  - page_size specified -> page defaults to 0
+        //  - Get a currency's sources
+        //  - Update entries by ids (bulk update entries)
     }
 }

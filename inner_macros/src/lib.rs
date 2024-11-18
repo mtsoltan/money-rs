@@ -41,15 +41,22 @@ fn make_option(ty: &Type) -> Type {
 /// - EntryResponse         - The user-facing response DTO from GET APIs
 ///
 /// All you have to do is specify attributes on fields. You can specify 6 different attributes:
-/// - NotUpdatable
-///   - The field is not present in database update DTO or update request DTO
-/// - NotViewable
+/// - NotInResponse
 ///   - The field is not present in the response DTO
 /// - HasDefault
 ///   - The field is optional in the new DTO and the create request DTO
-/// - NotSettable
-///   - The field is present in neither request DTO, and not present in the database update DTO.
-///   - It is, however, present in the database create DTO as it should be set by the server.
+/// - NotInDatabaseUpdate
+/// - NotInCreateRequest
+///   - Not in the create request DTO.
+///   - Having NotInCreateRequest does not mean we have to have a default. It can be a calculated
+///     value.
+/// - NotInUpdateRequest
+///   - Not in the update request DTO.
+/// - HasCalculatedDefault
+///   - Optional in create request DTO, but required in new. The back-end should calculate this
+///     value and provide it in new.
+///   - It does not need to also be optional in update request DTO, because everything in update
+///     request DTO is optional anyway.
 /// - Id
 ///   - The field is not present in the database create DTO as it is database-side generated.
 /// - RepresentableAsString
@@ -64,7 +71,7 @@ fn make_option(ty: &Type) -> Type {
 /// ```rust
 /// #[derive(inner_macros::Entity)]
 /// pub struct SomeEntity {
-///     #[entity(NotUpdatable, NotViewable, NotSettable, Id)]
+///     #[entity(NotInResponse, Id)]
 ///     pub some_field: i32,
 /// }
 /// ```
@@ -79,9 +86,9 @@ fn make_option(ty: &Type) -> Type {
 /// #[diesel(belongs_to(Category))]
 /// #[diesel(check_for_backend(diesel::pg::Pg))]
 /// pub struct Entry {
-///     #[entity(NotUpdatable, NotViewable, NotSettable, Id)]
+///     #[entity(NotInResponse, NotInDatabaseUpdate, NotInCreateRequest, Id)]
 ///     pub id: i32,
-///     #[entity(NotUpdatable, NotViewable, NotSettable)]
+///     #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
 ///     pub user_id: i32,
 ///     pub description: String,
 ///     #[entity(RepresentableAsString)]
@@ -89,7 +96,7 @@ fn make_option(ty: &Type) -> Type {
 ///     pub amount: f64,
 ///     #[entity(RepresentableAsString)]
 ///     pub date: NaiveDateTime,
-///     #[entity(NotUpdatable, NotSettable, HasDefault)]
+///     #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, HasDefault)]
 ///     pub created_at: NaiveDateTime,
 ///     #[entity(RepresentableAsString)]
 ///     pub currency_id: i32,
@@ -180,14 +187,12 @@ fn entity_macro_internal(
             if let Some(ident) = field.ident {
                 let mut push_to_new = true;
                 let mut option_in_new = false;
+                let mut option_in_create_request = false;
                 let mut push_to_create_request = true;
                 let mut push_to_update = true;
                 let mut push_to_update_request = true;
                 let mut push_to_response = true; // Also controls whether it's serialized
                 let mut representable_as_name = false;
-
-                let mut has_not_in_create = false;
-                let mut has_has_default = false;
 
                 for attr in field.attrs {
                     if attr.path().is_ident("entity") {
@@ -199,23 +204,25 @@ fn entity_macro_internal(
                                 .to_string()
                                 .as_str()
                             {
-                                "NotUpdatable" => {
-                                    push_to_update = false;
-                                    push_to_update_request = false;
-                                }
-                                "NotViewable" => {
+                                "NotInResponse" => {
                                     push_to_response = false;
                                 }
                                 "HasDefault" => {
-                                    has_has_default = true;
+                                    // option_in_new forces option_in_create_request, but not
+                                    // vice versa.
+                                    option_in_new = true;
                                 }
-                                "NotInCreate" => {
-                                    has_not_in_create = true;
+                                "HasCalculatedDefault" => {
+                                    option_in_create_request = true;
                                 }
-                                "NotSettable" => {
+                                "NotInCreateRequest" => {
                                     push_to_create_request = false;
-                                    push_to_update = false;
+                                }
+                                "NotInUpdateRequest" => {
                                     push_to_update_request = false;
+                                }
+                                "NotInDatabaseUpdate" => {
+                                    push_to_update = false;
                                 }
                                 "Id" => {
                                     push_to_new = false;
@@ -227,9 +234,8 @@ fn entity_macro_internal(
                                     return Err(syn::Error::new(
                                         attr.span(),
                                         format!(
-                                            "Unknown meta {other}. Expected a value in \
-                                             (NotUpdatable, NotViewable, NotSettable, Id, \
-                                             RepresentableAsString, HasDefault)"
+                                            "Unknown meta {other}. Expected a value in the values \
+                                             listed in the docblock of this fn"
                                         ),
                                     ));
                                 }
@@ -243,15 +249,6 @@ fn entity_macro_internal(
                             }
                         };
                     }
-                }
-
-                if has_not_in_create && has_has_default {
-                    push_to_new = false;
-                    push_to_create_request = false;
-                }
-
-                if !has_not_in_create && has_has_default {
-                    option_in_new = true;
                 }
 
                 let field_type = field.ty;
@@ -282,12 +279,17 @@ fn entity_macro_internal(
                     response_fields.push(quote! { pub #name_ident: #name_type });
                 }
 
+                let name_type_opt = make_option(&name_type);
                 let name_type = if option_in_new { make_option(&name_type) } else { name_type };
 
                 let new_type =
                     if option_in_new { field_type_opt.clone() } else { field_type.clone() };
 
-                let name_type_opt = make_option(&name_type);
+                let create_request_type = if option_in_create_request {
+                    name_type_opt.clone()
+                } else {
+                    name_type.clone()
+                };
 
                 entity_fields.push(quote! { pub #ident: #field_type });
 
@@ -296,7 +298,7 @@ fn entity_macro_internal(
                 }
 
                 if push_to_create_request {
-                    create_request_fields.push(quote! { pub #name_ident: #name_type });
+                    create_request_fields.push(quote! { pub #name_ident: #create_request_type });
                 }
 
                 if push_to_update {

@@ -34,19 +34,24 @@ diesel::table! {
     entries (id) {
         id -> Int4,
         user_id -> Int4,
-        description -> Text,
+        #[max_length = 255]
+        description -> Varchar,
+        long_description -> Nullable<Text>,
         #[max_length = 127]
         target -> Nullable<Varchar>,
         category_id -> Int4,
         amount -> Float8,
-        date -> Timestamp,
-        created_at -> Timestamp,
+        amount_in_fixed -> Float8,
         currency_id -> Int4,
         entry_type -> EntryT,
         source_id -> Int4,
+        source_amount -> Float8,
         secondary_source_id -> Nullable<Int4>,
-        conversion_rate -> Nullable<Float8>,
+        secondary_source_amount -> Nullable<Float8>,
+        conversion_rate -> Float8,
         conversion_rate_to_fixed -> Float8,
+        date -> Timestamp,
+        created_at -> Timestamp,
         archived -> Bool,
     }
 }

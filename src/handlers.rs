@@ -7,7 +7,6 @@ use diesel::insert_into;
 use diesel::prelude::*;
 use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::consts;
 use crate::http::{internal, ArrayQuery};
@@ -67,6 +66,14 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LoginResponse {
     pub token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FindEntriesResponse {
+    pub sum_per_month: HashMap<String, f64>,
+    pub monthly_average: f64,
+    pub sum_per_category_per_month: HashMap<String, f64>,
+    pub entries: Vec<EntryResponse>,
 }
 
 pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>) -> HttpResponse {
@@ -152,7 +159,9 @@ pub async fn create_user(
             .values(NewCurrency {
                 user_id: user.id,
                 name: std::mem::take(&mut data.currency),
+                // IEEE-754 float64 multiplication by 1 is always exact.
                 rate_to_fixed: 1.0f64,
+                archived: None,
             })
             .execute(&mut app_state.cpool())?;
 
@@ -186,7 +195,10 @@ pub async fn delete_user(
 
 impl From<StatefulTryFromError> for HttpResponse {
     fn from(error: StatefulTryFromError) -> HttpResponse {
-        HttpResponse::BadRequest().body(error.to_string())
+        match error {
+            StatefulTryFromError::LogicInternalError(_) => internal(error, "LogicInternalError"),
+            _ => HttpResponse::BadRequest().body(error.to_string()),
+        }
     }
 }
 
@@ -329,6 +341,8 @@ pub struct BulkRequest {
     ids: Vec<i32>,
 }
 
+/// Deleting returns amounts to their respective sources. Please use archive if you do not wish
+/// your entries to vanish from existence and their amounts be returned.
 pub async fn delete_entries(
     ArrayQuery(req): ArrayQuery<BulkRequest>,
     app_state: web::Data<AppState>,
@@ -442,6 +456,8 @@ macro_rules! archive_handler {
         }
     };
 }
+// TODO(10): BUG: Delete entry should return money to the sources, basically undo the action
+//  in create entry
 
 // TODO(15): ENDPOINT: /currency/{name}/sources - sources with balance in a country because: FE
 //  should send another GET request for sources to display:  The balance exists in the following
@@ -476,7 +492,7 @@ pub async fn find_entries(
     let user = user.into_inner();
     let app_state = app_state.into_inner();
 
-    match Entry::find_by_filter(&query_params, &user, app_state) {
+    match Entry::find_by_filter(&query_params, &user, app_state.clone()) {
         Ok(entries) => {
             let sum_amounts: f64 = entries.iter().map(|entry| entry.amount).sum();
 
@@ -486,7 +502,7 @@ pub async fn find_entries(
                 *sum_per_month.entry(month_year).or_insert(0.0) += entry.amount;
             }
             let num_months = sum_per_month.len() as f64;
-            let avg_per_month = sum_amounts / num_months;
+            let monthly_average = sum_amounts / num_months;
 
             let mut sum_per_category_per_month: HashMap<String, f64> = HashMap::new();
             for entry in &entries {
@@ -498,12 +514,16 @@ pub async fn find_entries(
             }
 
             // TODO(09): STRUCTURE: Replace me with a proper response struct
-            HttpResponse::Ok().json(json!({
-                "sum_per_month": sum_per_month,
-                "avg_per_month": avg_per_month,
-                "sum_per_category_per_month": sum_per_category_per_month,
-                "entries": entries,
-            }))
+            HttpResponse::Ok().json(FindEntriesResponse {
+                sum_per_month,
+                monthly_average,
+                sum_per_category_per_month,
+                entries: entries
+                    .into_iter()
+                    .map(|o| EntryResponse::stateful_try_from(o, &user, app_state.clone()))
+                    .filter_map(|o| o.ok())
+                    .collect(),
+            })
         }
         Err(e) => internal(e, "E007: Error finding entries"),
     }
@@ -564,4 +584,10 @@ TODO(70): EXTRA: Automatic tagging of entries:
   - description (updated to no longer have category, date, and entry type),
   Deduction from description works by trying to match to an existing description in database (by strict matching, or asking an LLM),
   and if not, by asking an LLM to come up with something of its own
+*/
+
+/*
+todos: three 5s, one 9, one 10, one 12, six 15s, one 20, two 30s, one 40, two 70s, one 75, three 80s
+after those todos, API will be pretty much done
+I can start work on front-end, and then v1 of thi
 */
