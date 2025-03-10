@@ -1,15 +1,20 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use ::pbkdf2::Pbkdf2;
 use actix_web::{web, HttpRequest, HttpResponse};
 use diesel::insert_into;
 use diesel::prelude::*;
+use futures::future::join_all;
+use itertools::Itertools;
+use log::error;
 use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
 
 use crate::consts;
 use crate::http::{internal, ArrayQuery};
+use crate::model::{EntryType, GetById};
 #[allow(unused_imports)]
 use crate::{
     model::{
@@ -22,6 +27,7 @@ use crate::{
     },
     AppState,
 };
+
 // We cannot skip serialization in any of the fields in the response, as in the tests,
 // we will need to reconstruct the response from the JSON string to reason about it,
 // in order to not have to write code that uses maps.
@@ -58,6 +64,7 @@ impl From<password_hash::Error> for ExternalServiceError {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
     username: String,
     password: String,
@@ -124,6 +131,7 @@ pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
     username: String,
     password: String,
@@ -246,7 +254,65 @@ macro_rules! create_handler {
 create_handler!(create_currency, currencies, CreateCurrencyRequest, NewCurrency, Currency);
 create_handler!(create_source, sources, CreateSourceRequest, NewSource, Source);
 create_handler!(create_category, categories, CreateCategoryRequest, NewCategory, Category);
-create_handler!(create_entry, entries, CreateEntryRequest, NewEntry, Entry);
+
+pub async fn create_entry(
+    _req: HttpRequest,
+    data: web::Json<CreateEntryRequest>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use crate::schema::entries::dsl;
+    let app_state = app_state.into_inner();
+    let creatable = <NewEntry as StatefulTryFrom<CreateEntryRequest>>::stateful_try_from(
+        data.into_inner(),
+        &user.into_inner(),
+        app_state.clone(),
+    );
+    let creatable = match creatable {
+        Err(e) => return HttpResponse::from(e),
+        Ok(c) => c,
+    };
+
+    let created =
+        insert_into(dsl::entries).values(creatable).get_result::<Entry>(&mut app_state.cpool());
+
+    let created = match created {
+        Ok(c) => c,
+        Err(e) => return if matches!(
+            e,
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _
+            )
+        ) {
+            HttpResponse::BadRequest()
+                .body(format!("{} already exists", Entry::specifier()))
+        } else {
+            internal(e, format!("E014: Failed to create {}", Entry::specifier()))
+        }
+    };
+
+    let source_result =
+        update_entry_sources(&created, app_state.clone(), UpdateEntrySourcesType::Create).await;
+    match source_result {
+        Err(e) => {
+            let (eid, sid) = match e {
+                UpdateEntrySourcesError::NoSource { entry_id, source_id, .. } => (entry_id, source_id),
+                UpdateEntrySourcesError::MalformedEntry { entry_id, source_id } => (entry_id, source_id),
+                UpdateEntrySourcesError::UpdateError { entry_id, source_id, .. } => (entry_id, source_id),
+            };
+            let error_string = format!(
+                "E018: Successfully created {} {}, but failed to get {} {:?} for it",
+                Entry::specifier(),
+                eid,
+                Source::specifier(),
+                sid,
+            );
+            internal(e, error_string)
+        }
+        Ok(_) => HttpResponse::Ok().json(CreateResponse { id: created.id }),
+    }
+}
 
 macro_rules! get_all_handler {
     ($fn_name:ident, $ent:ident, $resp:ident) => {
@@ -337,8 +403,114 @@ get_by_name_handler!(get_source_by_name, sources, Source, SourceResponse);
 get_by_name_handler!(get_category_by_name, categories, Category, CategoryResponse);
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BulkRequest {
     ids: Vec<i32>,
+}
+
+#[derive(thiserror::Error, Debug, Serialize)]
+pub enum UpdateEntrySourcesError {
+    #[error("failed to get source {source_id:?} for entry {entry_id}")]
+    NoSource {
+        entry_id: i32,
+        /// Secondary sources may be non-present. Wrap primary sources with Some() always.
+        source_id: Option<i32>,
+        #[serde(skip_serializing)]
+        #[source]
+        error: diesel::result::Error,
+    },
+    #[error("Entry {entry_id} is malformed, with source {source_id:?}")]
+    MalformedEntry {
+        entry_id: i32,
+        source_id: Option<i32>,
+    },
+    #[error("Failed to update source {source_id:?} for entry {entry_id}")]
+    UpdateError {
+        entry_id: i32,
+        source_id: Option<i32>,
+        #[serde(skip_serializing)]
+        #[source]
+        error: diesel::result::Error,
+    },
+}
+
+pub enum UpdateEntrySourcesType {
+    /// Adds entry values to source.
+    Create,
+    /// Subtracts entry values from source.
+    Delete,
+}
+
+async fn update_entry_sources(
+    entry: &Entry,
+    app_state: Arc<AppState>,
+    update_type: UpdateEntrySourcesType,
+) -> Result<i32, UpdateEntrySourcesError> {
+    let c1 = match update_type {
+        UpdateEntrySourcesType::Create => 1f64,
+        UpdateEntrySourcesType::Delete => -1f64,
+    };
+    let c2 = match entry.entry_type {
+        EntryType::Borrow => 1f64, // borrowing increases the source
+        EntryType::Lend => -1f64,
+        EntryType::Income => -1f64,
+        EntryType::Spend => 1f64,
+        EntryType::Convert => -1f64, // convert decreases primary source
+    };
+    let source = match Source::get_by_id(entry.source_id, app_state.clone()) {
+        Err(e) => {
+            return Err(UpdateEntrySourcesError::NoSource {
+                entry_id: entry.id,
+                source_id: Some(entry.source_id),
+                error: e,
+            })
+        }
+        Ok(s) => s,
+    };
+    let secondary_source = match Source::get_by_id(entry.secondary_source_id, app_state.clone()) {
+        Err(e) => {
+            return Err(UpdateEntrySourcesError::NoSource {
+                entry_id: entry.id,
+                source_id: entry.secondary_source_id,
+                error: e,
+            })
+        }
+        Ok(s) => s,
+    };
+    if entry.entry_type != EntryType::Convert && secondary_source.is_some() {
+        return Err(UpdateEntrySourcesError::MalformedEntry {
+            entry_id: entry.id,
+            source_id: entry.secondary_source_id
+        });
+    }
+    use crate::schema::sources::dsl::*;
+
+    match diesel::update(&source)
+        .set(amount.eq(source.amount + c1 * c2 * entry.source_amount))
+        .execute(&mut app_state.cpool()) {
+        Err(e) => return Err(UpdateEntrySourcesError::UpdateError {
+            entry_id: entry.id,
+            source_id: Some(entry.source_id),
+            error: e,
+        }),
+        Ok(_) => {},
+    };
+    if let Some(a) = entry.secondary_source_amount
+        && let Some(ss) = secondary_source
+    {
+        match diesel::update(&ss)
+            .set(amount.eq(ss.amount + c1 * a))
+            .execute(&mut app_state.cpool()) {
+            Err(e) => return Err(UpdateEntrySourcesError::UpdateError {
+                entry_id: entry.id,
+                source_id: entry.secondary_source_id,
+                error: e,
+            }),
+            Ok(_) => {},
+        };
+    }
+
+    Ok(entry.id)
 }
 
 /// Deleting returns amounts to their respective sources. Please use archive if you do not wish
@@ -349,13 +521,65 @@ pub async fn delete_entries(
     user: web::ReqData<User>,
 ) -> HttpResponse {
     use crate::schema::entries::dsl::*;
-    let deleted_count =
-        diesel::delete(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&req.ids)))
-            .execute(&mut app_state.cpool());
 
-    match deleted_count {
-        Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
-        Err(e) => internal(e, "E004: Failed to delete entities"),
+    let user = &user.into_inner();
+    let app_state = app_state.into_inner();
+
+    let fetched = match Entry::belonging_to(&user)
+        .select(Entry::as_select())
+        .filter(id.eq_any(&req.ids))
+        .load(&mut app_state.cpool())
+    {
+        Err(e) => {
+            return internal(
+                e,
+                format!("E016: Failed to get {} for deletion", Entry::specifier_plural()).as_str(),
+            )
+        }
+        Ok(f) => f,
+    };
+
+    let futures = fetched
+        .iter()
+        .map(|e| update_entry_sources(e, app_state.clone(), UpdateEntrySourcesType::Delete));
+    let source_map_result = join_all(futures).await;
+    let (oks, errs): (Vec<_>, Vec<_>) = source_map_result.into_iter().partition_result();
+    let deleted_count = diesel::delete(Entry::belonging_to(&user).filter(id.eq_any(oks)))
+        .execute(&mut app_state.cpool());
+
+    let errs_json = match serde_json::to_string(&errs) {
+        Err(e) => {
+            error!(
+                "Failed to serialize {} transaction errors as string {:?} with error {:?}",
+                Source::specifier(),
+                &errs,
+                e
+            );
+            format!(
+                "Failed to serialize {} transaction errors as string {:?}",
+                Source::specifier(),
+                &errs
+            )
+        }
+        Ok(o) => o,
+    };
+
+    match (deleted_count, errs.len()) {
+        (Ok(count), 0) => HttpResponse::Ok().json(CountResponse { count }),
+        (Ok(count), _) => internal(
+            errs,
+            // TODO(25): TEST: Test this specific pattern returning an error by force-db-deleting
+            //  the source.
+            format!(
+                "E017: Successfully deleted {} {}, but failed to get {} for {}: {}",
+                count,
+                Entry::specifier_plural(),
+                Source::specifier_plural(),
+                Entry::specifier_plural(),
+                errs_json,
+            ),
+        ),
+        (Err(e), _) => internal(e, format!("E004: Failed to delete {}", Entry::specifier_plural())),
     }
 }
 
@@ -456,8 +680,6 @@ macro_rules! archive_handler {
         }
     };
 }
-// TODO(10): BUG: Delete entry should return money to the sources, basically undo the action
-//  in create entry
 
 // TODO(15): ENDPOINT: /currency/{name}/sources - sources with balance in a country because: FE
 //  should send another GET request for sources to display:  The balance exists in the following
@@ -513,7 +735,6 @@ pub async fn find_entries(
                     entry.amount;
             }
 
-            // TODO(09): STRUCTURE: Replace me with a proper response struct
             HttpResponse::Ok().json(FindEntriesResponse {
                 sum_per_month,
                 monthly_average,

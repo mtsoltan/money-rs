@@ -167,6 +167,38 @@ fn entity_macro_internal(
             ));
         }
     };
+    let deny_unknown_vec = &ast
+        .attrs
+        .iter()
+        .filter_map(|el| {
+            if el.path().is_ident("serde") {
+                match el.parse_args::<Expr>() {
+                    Ok(expr) => match expr {
+                        Expr::Path(p) => {
+                            if let Some(ident) = p.path.get_ident()
+                                && ident == "deny_unknown_fields"
+                            {
+                                Some(Expr::Path(p))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    },
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let deny_unknown = if deny_unknown_vec.first().is_some() {
+        quote! {
+            #[serde(deny_unknown_fields)]
+        }
+    } else {
+        quote! {}
+    };
     let new_struct_name = Ident::new(format!("New{struct_name}").as_str(), Span::call_site());
     let create_request_struct_name =
         Ident::new(format!("Create{struct_name}Request").as_str(), Span::call_site());
@@ -326,6 +358,7 @@ fn entity_macro_internal(
         }
 
         #[derive(Debug, Serialize, Deserialize)]
+        #deny_unknown
         pub struct #create_request_struct_name {
             #(#create_request_fields,)*
         }
@@ -338,6 +371,7 @@ fn entity_macro_internal(
         }
 
         #[derive(Debug, Serialize, Deserialize)]
+        #deny_unknown
         pub struct #update_request_struct_name {
             #(#update_request_fields,)*
         }

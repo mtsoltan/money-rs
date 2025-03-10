@@ -36,6 +36,12 @@ pub enum StatefulTryFromError {
     LogicInternalError(Box<str>),
 }
 
+macro_rules! lbr {
+    ($error:tt) => {
+        return Err(StatefulTryFromError::LogicBadRequestError(Box::from($error)))
+    };
+}
+
 pub trait GetIdByNameAndUser<N, T> {
     fn get_id_by_name_and_user(
         name: N,
@@ -279,6 +285,7 @@ pub struct NewUser {
 #[diesel(table_name = currencies)]
 #[diesel(belongs_to(User))]
 #[diesel(check_for_backend(diesel::pg::Pg))]
+#[serde(deny_unknown_fields)]
 pub struct Currency {
     #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, Id)]
     pub id: i32,
@@ -334,6 +341,7 @@ impl StatefulTryFrom<Currency> for CurrencyResponse {
 #[diesel(belongs_to(User))]
 #[diesel(belongs_to(Currency))]
 #[diesel(check_for_backend(diesel::pg::Pg))]
+#[serde(deny_unknown_fields)]
 pub struct Source {
     #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, Id)]
     pub id: i32,
@@ -399,6 +407,7 @@ impl StatefulTryFrom<Source> for SourceResponse {
 #[diesel(table_name = categories)]
 #[diesel(belongs_to(User))]
 #[diesel(check_for_backend(diesel::pg::Pg))]
+#[serde(deny_unknown_fields)]
 pub struct Category {
     #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, Id)]
     pub id: i32,
@@ -448,6 +457,7 @@ impl StatefulTryFrom<Category> for CategoryResponse {
 #[diesel(belongs_to(Category))]
 #[diesel(belongs_to(Currency))]
 #[diesel(check_for_backend(diesel::pg::Pg))]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, Id)]
     pub id: i32,
@@ -486,8 +496,6 @@ pub struct Entry {
     #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
     pub amount_in_fixed: f64,
     /// If `currency_id` is provided, we use it to denominate the amount of the entry.
-    /// `currency_id` cannot be provided for entries of type `EntryType::Convert`, and are ignored
-    /// if they are.
     ///
     /// If `currency_id` is not provided for entries of any type, the `currency_id` of the source
     /// is used.
@@ -514,14 +522,9 @@ pub struct Entry {
     /// time. This is only present for entries of type `EntryType::Convert` or for those in which
     /// `currency_id` is provided and is different from that of the provided `source_id`.
     ///
-    /// This is `to / from`, so for example, the conversion rate for USD->JPY is 150.
+    /// This is `from_rtf / to_rtf`, so for example, the conversion rate for EGP->JPY is 3.
     ///
-    /// In the case of providing a `conversion_rate` for a non-`EntryType::Convert` entry, the
-    /// `conversion_rate`'s `to` is the specified currency, and `from` is the `source_id`'s
-    /// currency. For example, the conversion rate for specified currency = JPY when the source
-    /// is a USD source is 150.
-    ///
-    /// If not present, it is filled using the value from currency. For the cases in which the
+    /// It is filled using the value from currency. For the cases in which the
     /// `currency_id` is not provided, or it is the same as the one from `source_id`, this uses the
     /// default value of `1`, making it always-present.
     #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
@@ -547,83 +550,120 @@ pub struct Entry {
     pub archived: bool,
 }
 
+fn convert_currency(amount: f64, from: &Currency, to: &Currency) -> f64 {
+    from.rate_to_fixed / to.rate_to_fixed * amount
+}
+
 impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
     fn stateful_try_from(
         value: CreateEntryRequest,
         user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
+        // CreateEntryRequest has:
+        // Non-functional: description, long_description, category_id, date
+        // Functional: amount, source_id
+        // Non-convert: currency_id, source_amount
+        // Convert: secondary_source_id, secondary_source_amount
+        // Borrow/Lend: target
+        //
         // To confirm this logic, take an example in which USD is fixed,
-        // 300 JPY from an EGP source with JPY rate_to_fixed = 0.00667 and EGP rate_to_fixed = 0.02
+        // 300 JPY from an EGP source with:
+        // - JPY rate_to_fixed = 0.00667
+        // - EGP rate_to_fixed = 0.02
         // This should withdraw 100 EGP from the source and track as 2 fixed USDs consumed.
-        // For the secondary_* bindings, we can assume the 300 JPY are to be deposited in a
+        // For the secondary_* bindings, we can assume that the 300 JPY are to be deposited in a
         // secondary source in an entry of type `EntryType::Convert`.
 
         let primary_source = Source::get_by_name_and_user(value.source, &user, app_state.clone())?;
         let primary_source_currency =
             Currency::get_by_id(primary_source.currency_id, app_state.clone())?;
-        // We take the id and rate_to_fixed out because we're going to consume
-        // primary_source_currency.
-        let primary_source_currency_id = primary_source_currency.id;
-        let primary_source_currency_rtf = primary_source_currency.rate_to_fixed;
-        let secondary_source =
-            Source::get_by_name_and_user(value.secondary_source, &user, app_state.clone())?;
-        let secondary_source_currency = Currency::get_by_id(
-            secondary_source.as_ref().map(|o| o.currency_id),
-            app_state.clone(),
-        )?;
-        // to_currency = JPY, secondary_source_id = _, secondary_source_amount = 300 (if convert)
-        let (to_currency, secondary_source_id, secondary_source_amount) = match (
-            &value.entry_type,
-            &value.source_amount,
-            value.currency,
-            &secondary_source,
-            &value.secondary_source_amount,
-        ) {
-            (EntryType::Convert, None, None, Some(s), Some(a)) => match secondary_source_currency {
-                None => {
-                    return Err(StatefulTryFromError::LogicBadRequestError(Box::from(
-                        "Malformed CreateEntryRequest: Entries of type convert should always \
-                         specify a secondary source",
-                    )))
+        let value_currency =
+            Currency::get_by_name_and_user(value.currency.as_ref(), &user, app_state.clone())?;
+
+        let currency = match &value_currency {
+            Some(c) => c,
+            None => &primary_source_currency,
+        };
+
+        // primary_source_amount = 100 (from conversion from 300 JPY to EGP, not exact)
+        let source_amount = match (value.source_amount, &value_currency) {
+            // Explicitly specified source amount in request.
+            // Then, provided value amount is just for show.
+            (Some(a), _) => a,
+            // Explicitly provided currency in request.
+            // Then, the amount in request is assumed to be of that currency, and converted
+            // using the rtf conversion.
+            (None, Some(c)) => convert_currency(value.amount, &c, &primary_source_currency),
+            // No source amount or currency specified in request.
+            // Then, the amount in request is assumed to be of the primary source directly.
+            (None, None) => value.amount,
+        };
+        // 100 * 0.02 = 2 USD (exact to rate)
+        let amount_in_fixed = value.amount * currency.rate_to_fixed;
+        let conversion_rate;
+        let conversion_rate_to_fixed;
+        let mut secondary_source_id = None;
+        match &value.entry_type {
+            EntryType::Convert => {
+                let secondary_source = match Source::get_by_name_and_user(
+                    value.secondary_source,
+                    &user,
+                    app_state.clone(),
+                )? {
+                    Some(s) => s,
+                    None => lbr!(
+                        "Malformed CreateEntryRequest: Convert without secondary source (or with \
+                         an invalid secondary source)"
+                    ),
+                };
+                let secondary_source_currency = Currency::get_by_id(secondary_source.currency_id, app_state.clone())?;
+                secondary_source_id = Some(secondary_source.id);
+                if value.secondary_source_amount.is_none() {
+                    lbr!("Malformed CreateEntryRequest: Convert without secondary source amount");
+                };
+                if value.source_amount.is_some() && let Some(a) = value.source_amount && a != source_amount {
+                    lbr!(
+                        "Malformed CreateEntryRequest: Convert specified `source_amount` is a bad \
+                         idea so we disable it. Only specify the `amount` field"
+                    );
+                };
+                if value.currency.is_some() && let Some(c) = value.currency && c != primary_source_currency.name {
+                    lbr!(
+                        "Malformed CreateEntryRequest: Convert specified `currency` is a bad idea \
+                         so we disable it. Let's just use the currency from primary source"
+                    );
+                };
+                // amount_in_fixed = 100 * 0.02 = 2 (exact to rate)
+                // conversion_rate = 0.02 / 0.00667 = 3 (not exact)
+                // Anything that uses this will not be exact unless either currency or primary is
+                // fixed. Therefore, this should never be used, we should always
+                // rely on source amount.
+                conversion_rate =
+                    primary_source_currency.rate_to_fixed / secondary_source_currency.rate_to_fixed;
+                conversion_rate_to_fixed = secondary_source_currency.rate_to_fixed;
+            }
+            e => {
+                if (*e == EntryType::Borrow || *e == EntryType::Lend )&& value.target.is_none() {
+                    lbr!("Malformed CreateEntryRequest: Borrow/lend require a `target`");
                 }
-                Some(c) => (c, Some(s.id), Some(*a)),
-            },
-            (e, _, maybe_currency, None, None) if *e != EntryType::Convert => (
-                Currency::get_by_name_and_user(maybe_currency, &user, app_state.clone())?
-                    .unwrap_or(primary_source_currency),
-                None,
-                None,
-            ),
-            _ => {
-                return Err(StatefulTryFromError::LogicBadRequestError(Box::from(
-                    "Malformed CreateEntryRequest: Entry specifying wrong parameters for \
-                     source_amount / currency / secondary_source_id / secondary_source_amount",
-                )))
+                // amount + source -> amount is in the currency of source and is subtracted
+                if value.secondary_source.is_some() {
+                    lbr!(
+                        "Malformed CreateEntryRequest: Non-convert with specified secondary source"
+                    );
+                }
+                if value.secondary_source_amount.is_some() {
+                    lbr!(
+                        "Malformed CreateEntryRequest: Non-convert with specified secondary \
+                         source amount"
+                    );
+                }
+                // From the specified value currency to the primary source's.
+                conversion_rate = currency.rate_to_fixed / primary_source_currency.rate_to_fixed;
+                conversion_rate_to_fixed = primary_source_currency.rate_to_fixed;
             }
         };
-        // source_amount = 100 (from input)
-        let source_amount = if to_currency.id != primary_source_currency_id {
-            match value.source_amount {
-                None => {
-                    return Err(StatefulTryFromError::LogicBadRequestError(Box::from(
-                        "Malformed CreateEntryRequest: Currency different from primary specified, \
-                         but no source amount specified",
-                    )))
-                }
-                Some(o) => o,
-            }
-        } else {
-            value.amount
-        };
-        // amount_in_fixed = 100 * 0.02 = 2 (exact to rate)
-        let amount_in_fixed = source_amount * primary_source_currency_rtf;
-        // conversion_rate = 0.00667 / 0.02 = 0.3335 (not exact)
-        // Anything that uses this will not be exact unless either currency or primary is fixed.
-        // Therefore, this should never be used, we should always rely on source amount.
-        let conversion_rate = to_currency.rate_to_fixed / primary_source_currency_rtf;
-        // conversion_rate_to_fixed = 0.00667
-        let conversion_rate_to_fixed = to_currency.rate_to_fixed;
 
         Ok(Self {
             user_id: user.id,
@@ -639,14 +679,14 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
             date: NaiveDate::parse_from_str(value.date.as_str(), "%F")?.into(),
             created_at: None,
             entry_type: value.entry_type,
-            currency_id: to_currency.id,
+            currency_id: currency.id,
             amount_in_fixed,
             conversion_rate,
             conversion_rate_to_fixed,
             source_id: primary_source.id,
             source_amount,
             secondary_source_id,
-            secondary_source_amount,
+            secondary_source_amount: value.secondary_source_amount,
             archived: None,
         })
     }
@@ -725,6 +765,7 @@ impl StatefulTryFrom<Entry> for EntryResponse {
 /// - entry_types (IN)
 /// - limit (default: 500)
 #[derive(Debug, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EntryQuery {
     pub ids: Option<Vec<i32>>,
     pub sources: Option<Vec<String>>,
@@ -760,10 +801,10 @@ impl Entry {
             &query_params.amount.or(query_params.min_amount).or(query_params.max_amount);
 
         if amount_specified.is_some() && query_params.currency.is_none() {
-            return Err(StatefulTryFromError::LogicBadRequestError(Box::from(
+            lbr!(
                 "If you specify amount(s), you should always also specify currency. If you want \
-                 to do currency-agnostic comparison, use *_amount_in_fixed instead.",
-            )));
+                 to do currency-agnostic comparison, use *_amount_in_fixed instead."
+            );
         }
 
         let currencies = if let Some(c) = &query_params.currency {

@@ -17,8 +17,7 @@ use actix_web_httpauth::middleware::HttpAuthentication;
 use diesel::r2d2::ConnectionManager;
 use diesel::PgConnection;
 use handlers::login;
-
-pub type Pool = diesel::r2d2::Pool<ConnectionManager<PgConnection>>;
+use crate::consts::Pool;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -590,47 +589,90 @@ mod tests {
             "/api/entry",
             t,
             Some(json!({
-                    "entry_type": "Convert",
-                    "amount": 500.0,
-                    "source": "JPYWallet",
-                    "target": Some("Relative"),
-                    "category": "LivingExpenses",
-                    "description": "Sample Entry",
-                    "date": "2023-05-01",
-                    "currency": "USD",
-                    "conversion_rate_to_fixed": 1.00,
-                    "conversion_rate": 1.00
-                })),
+                "entry_type": "Convert",
+                "amount": 500.0,
+                "source": "JPYWallet",
+                "target": Some("Relative"),
+                "category": "LivingExpenses",
+                "description": "Sample Entry",
+                "date": "2023-05-01",
+                "currency": "USD",
+            })),
         )
-            .await;
+        .await;
         // Converts without second source should throw bad request
         assert_response_status(&res, StatusCode::BAD_REQUEST);
+        assert!(&res.body_string.contains("Malformed CreateEntryRequest"));
+
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::POST,
+            "/api/entry",
+            t,
+            Some(json!({
+                "entry_type": "Borrow",
+                "amount": 500.0,
+                "source": "JPYWallet",
+                "target": Some("Relative"),
+                "category": "LivingExpenses",
+                "description": "Sample Entry",
+                "date": "2023-05-01",
+                "currency": "USD",
+                "conversion_rate_to_fixed": 1.00,
+                "conversion_rate": 1.00
+            })),
+        )
+        .await;
+
+        // Requests with unknown fields should throw bad request
+        assert_response_status(&res, StatusCode::BAD_REQUEST);
+        assert!(&res.body_string.contains("Json deserialize error"));
 
         // 4. Create 20 Entries with varying types and attributes
+        enum Expected {
+            Success,
+            BadRequest,
+        }
+        #[rustfmt::skip]
         let entries_data = vec![
-            ("Borrow", 65.0, "USDBankAccount", Some("Relative"), "Entertainment", "2023-02-01"),
-            ("Convert", 400.0, "USDWallet", Some("USDWallet"), "RecurringExpenses", "2023-03-01"),
-            ("Spend", 90.0, "JPYBankAccount", None, "Entertainment", "2023-04-01"),
-            ("Income", 200.0, "JPYWallet", None, "RecurringExpenses", "2023-05-01"),
-            ("Lend", 75.0, "EGPBankAccount", Some("Associate"), "LivingExpenses", "2023-06-01"),
-            ("Borrow", 85.0, "EGPWallet", Some("Partner"), "Purchases", "2023-07-01"),
-            ("Convert", 500.0, "JPYWallet", Some("JPYBankAccount"), "Entertainment", "2023-08-01"), // TODO(5): Fix us...
-            ("Spend", 100.0, "USDBankAccount", None, "LivingExpenses", "2023-01-01"),
-            ("Income", 200.0, "USDWallet", None, "RecurringExpenses", "2023-02-01"),
-            ("Lend", 50.0, "USDBankAccount", Some("John Doe"), "Purchases", "2023-03-01"),
-            ("Borrow", 75.0, "USDWallet", Some("Jane Doe"), "Entertainment", "2023-04-01"),
-            ("Convert", 500.0, "USDBankAccount", Some("USDWallet"), "LivingExpenses", "2023-05-01"),
-            ("Spend", 120.0, "EGPBankAccount", None, "Purchases", "2023-06-01"),
-            ("Income", 130.0, "EGPWallet", None, "LivingExpenses", "2023-07-01"),
-            ("Lend", 80.0, "JPYBankAccount", Some("Friend"), "Entertainment", "2023-08-01"),
-            ("Borrow", 90.0, "JPYWallet", Some("Colleague"), "RecurringExpenses", "2023-09-01"),
-            ("Convert", 200.0, "EGPWallet", Some("EGPBankAccount"), "Purchases", "2023-10-01"),
-            ("Spend", 110.0, "USDWallet", None, "LivingExpenses", "2023-11-01"),
-            ("Income", 115.0, "JPYBankAccount", None, "Entertainment", "2023-12-01"),
-            ("Lend", 85.0, "USDWallet", Some("Neighbor"), "Purchases", "2024-01-01"),
+            ("Borrow",   65.0, "USD", "USDBankAccount", Some("Relative"),       None,                   None,          "Entertainment",     "2023-02-01", Expected::Success),
+            ("Convert", 400.0, "EGP", "USDWallet",      None,                   Some("JPYWallet"),      Some(61877.0), "RecurringExpenses", "2023-03-01", Expected::BadRequest), // EGP currency in this entry should be ignored in favor of secondary source's JPY
+            ("Spend",    90.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-04-01", Expected::Success),
+            ("Income",  200.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
+            ("Lend",     75.0, "USD", "EGPBankAccount", Some("Associate"),      None,                   None,          "LivingExpenses",    "2023-06-01", Expected::Success),
+            ("Borrow",   85.0, "USD", "EGPWallet",      Some("Partner"),        None,                   None,          "Purchases",         "2023-07-01", Expected::Success),
+            ("Convert", 500.0, "JPY", "JPYWallet",      None,                   Some("JPYBankAccount"), Some(400.0),   "Entertainment",     "2023-08-01", Expected::Success), // This conversion should just lose me money, but it should be valid
+            ("Spend",   100.0, "USD", "USDBankAccount", None,                   None,                   None,          "LivingExpenses",    "2023-01-01", Expected::Success),
+            ("Income",  200.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-02-01", Expected::Success),
+            ("Lend",     50.0, "USD", "USDBankAccount", Some("John Doe"),       None,                   None,          "Purchases",         "2023-03-01", Expected::Success),
+            ("Borrow",   75.0, "USD", "USDWallet",      Some("Jane Doe"),       None,                   None,          "Entertainment",     "2023-04-01", Expected::Success),
+            ("Convert", 500.0, "USD", "USDBankAccount", None,                   Some("EGPWallet"),      None,          "LivingExpenses",    "2023-05-01", Expected::BadRequest), // Convert without secondary source amount
+            ("Spend",   120.0, "USD", "EGPBankAccount", None,                   None,                   None,          "Purchases",         "2023-06-01", Expected::Success),
+            ("Income",  130.0, "USD", "EGPWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-07-01", Expected::Success),
+            ("Lend",     80.0, "USD", "JPYBankAccount", Some("Friend"),         None,                   None,          "Entertainment",     "2023-08-01", Expected::Success),
+            ("Borrow",   90.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-09-01", Expected::BadRequest), // Borrow / lend needs target
+            ("Convert", 200.0, "JPY", "JPYWallet",      None,                   Some("EGPBankAccount"), None,          "Purchases",         "2023-10-01", Expected::BadRequest), // Secondary source amount required on convert
+            ("Spend",   110.0, "USD", "USDWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-11-01", Expected::Success),
+            ("Income",  115.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-12-01", Expected::Success),
+            ("Lend",     85.0, "USD", "USDWallet",      Some("Neighbor"),       None,                   None,          "Purchases",         "2024-01-01", Expected::Success),
         ];
 
-        for (entry_type, amount, source, target, category, date) in entries_data {
+        for (
+            i,
+            (
+                entry_type,
+                amount,
+                currency,
+                source,
+                target,
+                secondary_source,
+                secondary_source_amount,
+                category,
+                date,
+                expected
+            ),
+        ) in entries_data.into_iter().enumerate()
+        {
             let res: TestResponse<EmptyResponse> = run_req(
                 &app,
                 Method::POST,
@@ -640,25 +682,31 @@ mod tests {
                     "entry_type": entry_type,
                     "amount": amount,
                     "source": source,
+                    "secondary_source": secondary_source,
+                    "secondary_source_amount": secondary_source_amount,
                     "target": target,
                     "category": category,
-                    "description": "Sample Entry",
+                    "description": format!("Sample Entry {i}"),
                     "date": date,
-                    "currency": "USD", // TODO(5): BUG: Should auto-convert if creating a USD entry from an EGP source - this is fixed, it just needs to be tested
-                    "conversion_rate_to_fixed": 1.00,
-                    "conversion_rate": 1.00 // TODO(5): STRUCTURE: this and conversion_rate_to_fixed should not be provided in requests - this is fixed it just needs to be tested
+                    "currency": currency,
                 })),
             )
             .await;
-            assert_response_status_is_success(&res);
+            match expected {
+                Expected::Success => assert_response_status_is_success(&res),
+                Expected::BadRequest => assert_response_status(&res, StatusCode::BAD_REQUEST),
+            }
         }
+        // TODO(09): Assert that auto-convert happens, assert that currency is ignored in favor of
+        //  second source in case of convert, assert that all converts succeed and are sound,
+        //  assert final values of sources
 
-        // 5. Get all entries and ensure the count is 20
+        // 5. Get all entries and ensure the count is 16 - the other 4 are bad requests
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/entry/all", t, None).await;
         assert_response_status_is_success(&res);
         let all_entries = res.body.expect("Expected entries in response");
-        assert_eq!(all_entries.len(), 20, "Expected 20 entries initially");
+        assert_eq!(all_entries.len(), 16, "Expected 20 entries initially");
 
         // 6. Archive 2 entries and delete 2 entries
         let res: TestResponse<EmptyResponse> = run_req(
@@ -681,12 +729,12 @@ mod tests {
         .await;
         assert_response_status_is_success(&res);
 
-        // 7. Ensure count is now 18 and 2 archived entries
+        // 7. Ensure count is now 14 and 2 archived entries
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/entry/all", t, None).await;
         assert_response_status_is_success(&res);
         let body = res.body.expect("Expected entries in response");
-        assert_eq!(body.len(), 18, "Expected 18 entries after deletion");
+        assert_eq!(body.len(), 14, "Expected 18 entries after deletion");
         assert_eq!(body.iter().filter(|o| o.archived).count(), 2, "Expected 2 archived entries");
 
         // 8. Use find entries with different filters and verify results
