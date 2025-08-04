@@ -1,10 +1,11 @@
-use diesel::PgConnection;
-use diesel::r2d2::ConnectionManager;
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::deadpool::Object;
 
 pub(crate) const EPSILON: f64 = 1e-5f64;
 
-pub type Pool = diesel::r2d2::Pool<ConnectionManager<PgConnection>>;
-
+pub type Pool = diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>;
+pub type Conn = Object<AsyncPgConnection>;
+/*
 use diesel::backend::Backend;
 use diesel::connection::{AnsiTransactionManager, TransactionManager};
 use diesel::pg::Pg;
@@ -24,12 +25,7 @@ where
     C: Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
     pub(crate) fn new(connection: &'a mut C) -> Self {
-        Self {
-            connection,
-            isolation_level: None,
-            read_mode: None,
-            deferrable: None,
-        }
+        Self { connection, isolation_level: None, read_mode: None, deferrable: None }
     }
 
     pub fn read_only(mut self) -> Self {
@@ -67,7 +63,7 @@ where
         self
     }
 
-    pub fn start_transaction(&mut self) ->  QueryResult<()> {
+    pub fn start_transaction(&mut self) -> QueryResult<()> {
         let mut query_builder = <Pg as Backend>::QueryBuilder::default();
         self.to_sql(&mut query_builder, &Pg)?;
         let sql = query_builder.finish();
@@ -149,3 +145,4 @@ impl QueryFragment<Pg> for Deferrable {
         Ok(())
     }
 }
+*/

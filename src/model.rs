@@ -1,18 +1,24 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
+use diesel::{
+    Associations, BelongingToDsl, BoolExpressionMethods, ExpressionMethods, Identifiable,
+    Insertable, PgTextExpressionMethods, QueryDsl, Queryable, Selectable, debug_query,
+};
+use futures::future::join_all;
 use log::warn;
 use serde::{Deserialize, Serialize};
 
 // Needed by macros
 #[rustfmt::skip]
 use {
-    diesel::*, // Used by `inner_macros::Entity`
     crate::schema::*,
     crate::schema::sql_types::EntryT, // Used by `diesel_derive_enum::DbEnum`
     crate::AppState,
     inner_macros::Entity // The `inner_macros::Entity` derivable macro itself
 };
+use diesel_async::RunQueryDsl as _;
 
 #[derive(Debug, PartialEq, Clone, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
 #[ExistingTypePath = "EntryT"]
@@ -42,62 +48,87 @@ macro_rules! lbr {
     };
 }
 
+#[async_trait]
 pub trait GetIdByNameAndUser<N, T> {
-    fn get_id_by_name_and_user(
+    async fn get_id_by_name_and_user(
         name: N,
         user: &User,
         app_state: Arc<AppState>,
-    ) -> Result<T, diesel::result::Error>;
+    ) -> Result<T, diesel::result::Error>
+    where
+        N: 'async_trait,
+        T: 'async_trait;
 }
 
+#[async_trait]
 pub trait GetByNameAndUser<N, T> {
-    fn get_by_name_and_user(
+    async fn get_by_name_and_user(
         name: N,
         user: &User,
         app_state: Arc<AppState>,
-    ) -> Result<T, diesel::result::Error>;
+    ) -> Result<T, diesel::result::Error>
+    where
+        N: 'async_trait,
+        T: 'async_trait;
 }
 
+#[async_trait]
 pub trait GetNameById<N, T> {
-    fn get_name_by_id(id: N, app_state: Arc<AppState>) -> Result<T, diesel::result::Error>;
+    async fn get_name_by_id(id: N, app_state: Arc<AppState>) -> Result<T, diesel::result::Error>
+    where
+        N: 'async_trait,
+        T: 'async_trait;
 }
 
+#[async_trait]
 pub trait GetById<N, T> {
-    fn get_by_id(id: N, app_state: Arc<AppState>) -> Result<T, diesel::result::Error>;
+    async fn get_by_id(id: N, app_state: Arc<AppState>) -> Result<T, diesel::result::Error>
+    where
+        N: 'async_trait,
+        T: 'async_trait;
 }
 
+#[async_trait]
 pub trait GetNetAmount {
-    fn get_net_amount<'a>(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error>;
+    async fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error>;
 }
 
+#[async_trait]
 impl GetNetAmount for Currency {
-    fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
+    async fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
         use crate::schema::sources::dsl::*;
         let entry_amount_sum: f64 = Source::belonging_to(&self)
             .filter(archived.eq(false))
             .select(amount)
-            .load(&mut app_state.cpool())?
+            .load(&mut app_state.cpool().await)
+            .await?
             .iter()
             .sum();
         Ok(entry_amount_sum)
     }
 }
 
+#[async_trait]
 impl GetNetAmount for Source {
-    fn get_net_amount(&self, _app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
+    async fn get_net_amount(
+        &self,
+        _app_state: Arc<AppState>,
+    ) -> Result<f64, diesel::result::Error> {
         Ok(self.amount)
     }
 }
 
+#[async_trait]
 impl GetNetAmount for Category {
-    fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
+    async fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
         use diesel::dsl::sum;
 
         use crate::schema::entries::dsl::*;
         let entry_amount_sum: f64 = Entry::belonging_to(&self)
             .filter(archived.eq(false))
             .select(sum(amount))
-            .load::<Option<f64>>(&mut app_state.cpool())?
+            .load::<Option<f64>>(&mut app_state.cpool().await)
+            .await?
             .iter()
             .map(|x| x.unwrap_or(0.0f64))
             .sum();
@@ -107,32 +138,41 @@ impl GetNetAmount for Category {
 
 macro_rules! get_impls {
     ($type:ty, $tb_name:ident) => {
+        #[async_trait]
         impl<T> GetIdByNameAndUser<T, i32> for $type
         where
-            T: Into<String>,
+            T: Into<String> + Send,
         {
-            fn get_id_by_name_and_user(
+            async fn get_id_by_name_and_user(
                 p_name: T,
                 user: &User,
                 app_state: Arc<AppState>,
-            ) -> Result<i32, diesel::result::Error> {
+            ) -> Result<i32, diesel::result::Error>
+            where
+                T: 'async_trait,
+            {
                 use crate::schema::$tb_name::dsl::*;
                 $tb_name
                     .filter(name.eq(p_name.into()).and(user_id.eq(user.id)))
                     .select(id)
-                    .first(&mut app_state.cpool())
+                    .first(&mut app_state.cpool().await)
+                    .await
             }
         }
 
+        #[async_trait]
         impl<T> GetIdByNameAndUser<Option<T>, Option<i32>> for $type
         where
-            T: Into<String>,
+            T: Into<String> + Send,
         {
-            fn get_id_by_name_and_user(
+            async fn get_id_by_name_and_user(
                 p_name: Option<T>,
                 user: &User,
                 app_state: Arc<AppState>,
-            ) -> Result<Option<i32>, diesel::result::Error> {
+            ) -> Result<Option<i32>, diesel::result::Error>
+            where
+                T: 'async_trait,
+            {
                 Ok(match p_name {
                     None => None,
                     Some(c) => {
@@ -141,38 +181,48 @@ macro_rules! get_impls {
                             $tb_name
                                 .filter(name.eq(c.into()).and(user_id.eq(user.id)))
                                 .select(id)
-                                .first(&mut app_state.cpool())?,
+                                .first(&mut app_state.cpool().await)
+                                .await?,
                         )
                     }
                 })
             }
         }
 
+        #[async_trait]
         impl<T> GetByNameAndUser<T, $type> for $type
         where
-            T: Into<String>,
+            T: Into<String> + Send,
         {
-            fn get_by_name_and_user(
+            async fn get_by_name_and_user(
                 p_name: T,
                 user: &User,
                 app_state: Arc<AppState>,
-            ) -> Result<$type, diesel::result::Error> {
+            ) -> Result<$type, diesel::result::Error>
+            where
+                T: 'async_trait,
+            {
                 use crate::schema::$tb_name::dsl::*;
                 $tb_name
                     .filter(name.eq(p_name.into()).and(user_id.eq(user.id)))
-                    .first(&mut app_state.cpool())
+                    .first(&mut app_state.cpool().await)
+                    .await
             }
         }
 
+        #[async_trait]
         impl<T> GetByNameAndUser<Option<T>, Option<$type>> for $type
         where
-            T: Into<String>,
+            T: Into<String> + Send,
         {
-            fn get_by_name_and_user(
+            async fn get_by_name_and_user(
                 p_name: Option<T>,
                 user: &User,
                 app_state: Arc<AppState>,
-            ) -> Result<Option<$type>, diesel::result::Error> {
+            ) -> Result<Option<$type>, diesel::result::Error>
+            where
+                T: 'async_trait,
+            {
                 Ok(match p_name {
                     None => None,
                     Some(c) => {
@@ -180,25 +230,28 @@ macro_rules! get_impls {
                         Some(
                             $tb_name
                                 .filter(name.eq(c.into()).and(user_id.eq(user.id)))
-                                .first(&mut app_state.cpool())?,
+                                .first(&mut app_state.cpool().await)
+                                .await?,
                         )
                     }
                 })
             }
         }
 
+        #[async_trait]
         impl GetNameById<i32, String> for $type {
-            fn get_name_by_id(
+            async fn get_name_by_id(
                 p_id: i32,
                 app_state: Arc<AppState>,
             ) -> Result<String, diesel::result::Error> {
                 use crate::schema::$tb_name::dsl::*;
-                $tb_name.find(p_id).select(name).first(&mut app_state.cpool())
+                $tb_name.find(p_id).select(name).first(&mut app_state.cpool().await).await
             }
         }
 
+        #[async_trait]
         impl GetNameById<Option<i32>, Option<String>> for $type {
-            fn get_name_by_id(
+            async fn get_name_by_id(
                 p_id: Option<i32>,
                 app_state: Arc<AppState>,
             ) -> Result<Option<String>, diesel::result::Error> {
@@ -206,24 +259,32 @@ macro_rules! get_impls {
                     None => None,
                     Some(c) => {
                         use crate::schema::$tb_name::dsl::*;
-                        Some($tb_name.find(c).select(name).first(&mut app_state.cpool())?)
+                        Some(
+                            $tb_name
+                                .find(c)
+                                .select(name)
+                                .first(&mut app_state.cpool().await)
+                                .await?,
+                        )
                     }
                 })
             }
         }
 
+        #[async_trait]
         impl GetById<i32, $type> for $type {
-            fn get_by_id(
+            async fn get_by_id(
                 p_id: i32,
                 app_state: Arc<AppState>,
             ) -> Result<$type, diesel::result::Error> {
                 use crate::schema::$tb_name::dsl::*;
-                $tb_name.find(p_id).first(&mut app_state.cpool())
+                $tb_name.find(p_id).first(&mut app_state.cpool().await).await
             }
         }
 
+        #[async_trait]
         impl GetById<Option<i32>, Option<$type>> for $type {
-            fn get_by_id(
+            async fn get_by_id(
                 p_id: Option<i32>,
                 app_state: Arc<AppState>,
             ) -> Result<Option<$type>, diesel::result::Error> {
@@ -231,7 +292,7 @@ macro_rules! get_impls {
                     None => None,
                     Some(c) => {
                         use crate::schema::$tb_name::dsl::*;
-                        Some($tb_name.find(c).first(&mut app_state.cpool())?)
+                        Some($tb_name.find(c).first(&mut app_state.cpool().await).await?)
                     }
                 })
             }
@@ -243,20 +304,26 @@ get_impls!(Currency, currencies);
 get_impls!(Category, categories);
 get_impls!(Source, sources);
 
+#[async_trait]
 impl GetById<i32, Entry> for Entry {
-    fn get_by_id(p_id: i32, app_state: Arc<AppState>) -> Result<Entry, diesel::result::Error> {
+    async fn get_by_id(
+        p_id: i32,
+        app_state: Arc<AppState>,
+    ) -> Result<Entry, diesel::result::Error> {
         use crate::schema::entries::dsl::*;
-        entries.find(p_id).first(&mut app_state.cpool())
+        entries.find(p_id).first(&mut app_state.cpool().await).await
     }
 }
 
+#[async_trait]
 pub trait StatefulTryFrom<S> {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: S,
         user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError>
     where
+        S: Send,
         Self: Sized;
 }
 
@@ -292,15 +359,16 @@ pub struct Currency {
     #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
     pub user_id: i32,
     pub name: String,
-    /// This is the amount of fixed currency that fits within 1 this currency that fits within .
+    /// This is the amount of fixed currency that fits within 1 this currency that fits within.
     /// For example, the JPY rate_to_fixed would be 0.00667 if the USD is fixed.
     pub rate_to_fixed: f64,
     #[entity(HasDefault, NotInCreateRequest)]
     pub archived: bool,
 }
 
+#[async_trait]
 impl StatefulTryFrom<CreateCurrencyRequest> for NewCurrency {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: CreateCurrencyRequest,
         user: &User,
         _app_state: Arc<AppState>,
@@ -314,8 +382,9 @@ impl StatefulTryFrom<CreateCurrencyRequest> for NewCurrency {
     }
 }
 
+#[async_trait]
 impl StatefulTryFrom<UpdateCurrencyRequest> for UpdateCurrency {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: UpdateCurrencyRequest,
         _user: &User,
         _app_state: Arc<AppState>,
@@ -324,8 +393,9 @@ impl StatefulTryFrom<UpdateCurrencyRequest> for UpdateCurrency {
     }
 }
 
+#[async_trait]
 impl StatefulTryFrom<Currency> for CurrencyResponse {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: Currency,
         _user: &User,
         _app_state: Arc<AppState>,
@@ -356,8 +426,9 @@ pub struct Source {
     pub archived: bool,
 }
 
+#[async_trait]
 impl StatefulTryFrom<CreateSourceRequest> for NewSource {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: CreateSourceRequest,
         user: &User,
         app_state: Arc<AppState>,
@@ -369,15 +440,17 @@ impl StatefulTryFrom<CreateSourceRequest> for NewSource {
                 value.currency.as_str(),
                 &user,
                 app_state.clone(),
-            )?,
+            )
+            .await?,
             amount: value.amount,
             archived: value.archived,
         })
     }
 }
 
+#[async_trait]
 impl StatefulTryFrom<UpdateSourceRequest> for UpdateSource {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: UpdateSourceRequest,
         _user: &User,
         _app_state: Arc<AppState>,
@@ -386,15 +459,16 @@ impl StatefulTryFrom<UpdateSourceRequest> for UpdateSource {
     }
 }
 
+#[async_trait]
 impl StatefulTryFrom<Source> for SourceResponse {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: Source,
         _user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
         Ok(Self {
             name: value.name,
-            currency: Currency::get_name_by_id(value.currency_id, app_state.clone())?,
+            currency: Currency::get_name_by_id(value.currency_id, app_state.clone()).await?,
             amount: value.amount,
             archived: value.archived,
         })
@@ -418,8 +492,9 @@ pub struct Category {
     archived: bool,
 }
 
+#[async_trait]
 impl StatefulTryFrom<CreateCategoryRequest> for NewCategory {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: CreateCategoryRequest,
         user: &User,
         _app_state: Arc<AppState>,
@@ -428,8 +503,9 @@ impl StatefulTryFrom<CreateCategoryRequest> for NewCategory {
     }
 }
 
+#[async_trait]
 impl StatefulTryFrom<UpdateCategoryRequest> for UpdateCategory {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: UpdateCategoryRequest,
         _user: &User,
         _app_state: Arc<AppState>,
@@ -438,8 +514,9 @@ impl StatefulTryFrom<UpdateCategoryRequest> for UpdateCategory {
     }
 }
 
+#[async_trait]
 impl StatefulTryFrom<Category> for CategoryResponse {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: Category,
         _user: &User,
         _app_state: Arc<AppState>,
@@ -464,8 +541,8 @@ pub struct Entry {
     #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
     pub user_id: i32,
     /// User-entered description, we can match this to previously entered descriptions and try to
-    /// decide values for other fields. In case of multi-line descriptions, the first line of the
-    /// description is displayed and used for filtering, while the rest of the description is
+    /// decide values for other fields. In the case of multi-line descriptions, the first line of
+    /// the description is displayed and used for filtering, while the rest of the description is
     /// kept for memory, but stored inside `long_description` displayed under ellipsis.
     pub description: String,
     /// If the user checks the multi-line checkbox, they can specify this. The first line of
@@ -554,8 +631,9 @@ fn convert_currency(amount: f64, from: &Currency, to: &Currency) -> f64 {
     from.rate_to_fixed / to.rate_to_fixed * amount
 }
 
+#[async_trait]
 impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: CreateEntryRequest,
         user: &User,
         app_state: Arc<AppState>,
@@ -575,11 +653,13 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
         // For the secondary_* bindings, we can assume that the 300 JPY are to be deposited in a
         // secondary source in an entry of type `EntryType::Convert`.
 
-        let primary_source = Source::get_by_name_and_user(value.source, &user, app_state.clone())?;
+        let primary_source =
+            Source::get_by_name_and_user(value.source, &user, app_state.clone()).await?;
         let primary_source_currency =
-            Currency::get_by_id(primary_source.currency_id, app_state.clone())?;
+            Currency::get_by_id(primary_source.currency_id, app_state.clone()).await?;
         let value_currency =
-            Currency::get_by_name_and_user(value.currency.as_ref(), &user, app_state.clone())?;
+            Currency::get_by_name_and_user(value.currency.as_ref(), &user, app_state.clone())
+                .await?;
 
         let currency = match &value_currency {
             Some(c) => c,
@@ -610,25 +690,34 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                     value.secondary_source,
                     &user,
                     app_state.clone(),
-                )? {
+                )
+                .await?
+                {
                     Some(s) => s,
                     None => lbr!(
                         "Malformed CreateEntryRequest: Convert without secondary source (or with \
                          an invalid secondary source)"
                     ),
                 };
-                let secondary_source_currency = Currency::get_by_id(secondary_source.currency_id, app_state.clone())?;
+                let secondary_source_currency =
+                    Currency::get_by_id(secondary_source.currency_id, app_state.clone()).await?;
                 secondary_source_id = Some(secondary_source.id);
                 if value.secondary_source_amount.is_none() {
                     lbr!("Malformed CreateEntryRequest: Convert without secondary source amount");
                 };
-                if value.source_amount.is_some() && let Some(a) = value.source_amount && a != source_amount {
+                if value.source_amount.is_some()
+                    && let Some(a) = value.source_amount
+                    && a != source_amount
+                {
                     lbr!(
                         "Malformed CreateEntryRequest: Convert specified `source_amount` is a bad \
                          idea so we disable it. Only specify the `amount` field"
                     );
                 };
-                if value.currency.is_some() && let Some(c) = value.currency && c != primary_source_currency.name {
+                if value.currency.is_some()
+                    && let Some(c) = value.currency
+                    && c != primary_source_currency.name
+                {
                     lbr!(
                         "Malformed CreateEntryRequest: Convert specified `currency` is a bad idea \
                          so we disable it. Let's just use the currency from primary source"
@@ -644,7 +733,7 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                 conversion_rate_to_fixed = secondary_source_currency.rate_to_fixed;
             }
             e => {
-                if (*e == EntryType::Borrow || *e == EntryType::Lend )&& value.target.is_none() {
+                if (*e == EntryType::Borrow || *e == EntryType::Lend) && value.target.is_none() {
                     lbr!("Malformed CreateEntryRequest: Borrow/lend require a `target`");
                 }
                 // amount + source -> amount is in the currency of source and is subtracted
@@ -674,7 +763,8 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                 value.category.as_str(),
                 &user,
                 app_state.clone(),
-            )?,
+            )
+            .await?,
             amount: value.amount,
             date: NaiveDate::parse_from_str(value.date.as_str(), "%F")?.into(),
             created_at: None,
@@ -693,8 +783,9 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
 }
 
 /// See the `CreateEntryRequest` implementation for more details on the logic.
+#[async_trait]
 impl StatefulTryFrom<UpdateEntryRequest> for UpdateEntry {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: UpdateEntryRequest,
         user: &User,
         app_state: Arc<AppState>,
@@ -707,7 +798,8 @@ impl StatefulTryFrom<UpdateEntryRequest> for UpdateEntry {
                 value.category,
                 &user,
                 app_state.clone(),
-            )?,
+            )
+            .await?,
             date: match value.date {
                 None => None,
                 Some(c) => Some(NaiveDate::parse_from_str(c.as_str(), "%F")?.into()),
@@ -717,8 +809,9 @@ impl StatefulTryFrom<UpdateEntryRequest> for UpdateEntry {
     }
 }
 
+#[async_trait]
 impl StatefulTryFrom<Entry> for EntryResponse {
-    fn stateful_try_from(
+    async fn stateful_try_from(
         value: Entry,
         _user: &User,
         app_state: Arc<AppState>,
@@ -728,16 +821,17 @@ impl StatefulTryFrom<Entry> for EntryResponse {
             description: value.description,
             long_description: value.long_description,
             target: value.target,
-            category: Category::get_name_by_id(value.category_id, app_state.clone())?,
+            category: Category::get_name_by_id(value.category_id, app_state.clone()).await?,
             amount: value.amount,
             amount_in_fixed: value.amount_in_fixed,
             date: value.date.format("%F").to_string(),
             created_at: value.created_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-            currency: Currency::get_name_by_id(value.currency_id, app_state.clone())?,
+            currency: Currency::get_name_by_id(value.currency_id, app_state.clone()).await?,
             entry_type: value.entry_type,
-            source: Source::get_name_by_id(value.source_id, app_state.clone())?,
+            source: Source::get_name_by_id(value.source_id, app_state.clone()).await?,
             source_amount: value.source_amount,
-            secondary_source: Source::get_name_by_id(value.secondary_source_id, app_state.clone())?,
+            secondary_source: Source::get_name_by_id(value.secondary_source_id, app_state.clone())
+                .await?,
             secondary_source_amount: value.secondary_source_amount,
             conversion_rate: value.conversion_rate,
             conversion_rate_to_fixed: value.conversion_rate_to_fixed,
@@ -789,7 +883,7 @@ pub struct EntryQuery {
 }
 
 impl Entry {
-    pub fn find_by_filter(
+    pub async fn find_by_filter(
         query_params: &EntryQuery,
         user: &User,
         app_state: Arc<AppState>,
@@ -821,32 +915,35 @@ impl Entry {
         }
 
         if let Some(names) = &query_params.sources {
-            let ids: Vec<_> = names
-                .iter()
-                .filter_map(|name| {
-                    Source::get_id_by_name_and_user(name.as_str(), &user, app_state.clone()).ok()
-                })
-                .collect();
+            let ids = join_all(names.into_iter().map(async |name| {
+                Source::get_id_by_name_and_user(name, &user, app_state.clone()).await
+            }))
+            .await
+            .into_iter()
+            .filter_map(|id_result| id_result.ok())
+            .collect::<Vec<i32>>();
 
             query = query.filter(source_id.eq_any(ids));
         }
         if let Some(names) = currencies {
-            let ids: Vec<_> = names
-                .iter()
-                .filter_map(|name| {
-                    Currency::get_id_by_name_and_user(name.as_str(), &user, app_state.clone()).ok()
-                })
-                .collect();
+            let ids: Vec<_> = join_all(names.iter().map(async |name| {
+                Currency::get_id_by_name_and_user(name.as_str(), &user, app_state.clone()).await
+            }))
+            .await
+            .into_iter()
+            .filter_map(|id_result| id_result.ok())
+            .collect::<Vec<i32>>();
 
             query = query.filter(currency_id.eq_any(ids));
         }
         if let Some(names) = &query_params.categories {
-            let ids: Vec<_> = names
-                .iter()
-                .filter_map(|name| {
-                    Category::get_id_by_name_and_user(name.as_str(), &user, app_state.clone()).ok()
-                })
-                .collect();
+            let ids: Vec<_> = join_all(names.iter().map(async |name| {
+                Category::get_id_by_name_and_user(name.as_str(), &user, app_state.clone()).await
+            }))
+            .await
+            .into_iter()
+            .filter_map(|id_result| id_result.ok())
+            .collect::<Vec<i32>>();
 
             query = query.filter(category_id.eq_any(ids));
         }
@@ -912,15 +1009,16 @@ impl Entry {
 
         if let Some(sort) = &query_params.sort {
             match sort.as_str() {
-                "amount_asc" => query = query.order(amount.asc()),
-                "amount_desc" => query = query.order(amount.desc()),
-                "date_asc" => query = query.order(date.asc()),
-                "date_desc" => query = query.order(date.desc()),
-                _ => (),
+                "amount_asc" => query = query.order((amount.asc(), created_at.asc(), id.asc())),
+                "amount_desc" => query = query.order((amount.desc(), created_at.asc(), id.asc())),
+                "date_asc" => query = query.order((date.asc(), created_at.asc(), id.asc())),
+                "date_desc" => query = query.order((date.desc(), created_at.desc(), id.desc())),
+                _ => query = query.order((date.asc(), created_at.asc(), id.asc())),
             }
         }
 
-        let r_entries = query.load::<Entry>(&mut app_state.cpool())?;
+        dbg!(debug_query(&query));
+        let r_entries = query.load::<Entry>(&mut app_state.cpool().await).await?;
 
         Ok(r_entries)
     }

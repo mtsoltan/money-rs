@@ -1,8 +1,9 @@
 #![feature(try_blocks)]
-#![feature(let_chains)]
 #![feature(type_alias_impl_trait)]
 #![feature(trait_alias)]
 #![feature(stmt_expr_attributes)]
+
+extern crate core;
 
 mod authentication;
 mod consts;
@@ -12,12 +13,13 @@ mod http;
 mod model;
 mod schema;
 
-use actix_web::{web, App, HttpServer};
+use actix_web::{App, HttpServer, web};
 use actix_web_httpauth::middleware::HttpAuthentication;
-use diesel::r2d2::ConnectionManager;
-use diesel::PgConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use handlers::login;
-use crate::consts::Pool;
+
+use crate::consts::{Conn, Pool};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,25 +27,25 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn cpool(&self) -> r2d2::PooledConnection<ConnectionManager<PgConnection>> {
-        self.pool.clone().get().expect("Pool should be initialized")
+    pub async fn cpool(&self) -> Conn {
+        self.pool.clone().get().await.expect("Pool should be initialized")
     }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_vars::init();
-    HttpServer::new(move || app(&pool())).bind(env_vars::bind_address())?.run().await
+    HttpServer::new(move || app(pool())).bind(env_vars::bind_address())?.run().await
 }
 
 fn pool() -> Pool {
     env_vars::init();
-    let manager = ConnectionManager::<PgConnection>::new(env_vars::database_url());
-    Pool::builder().build(manager).expect("Failed to create pool")
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(env_vars::database_url());
+    Pool::builder(manager).build().expect("Failed to create pool")
 }
 
 fn app(
-    pool: &Pool,
+    pool: Pool,
 ) -> App<
     impl actix_web::dev::ServiceFactory<
         actix_web::dev::ServiceRequest,
@@ -71,7 +73,7 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
-                        // TODO(15): ENDPOINT: unimplemented
+                        // TODO(15): ENDPOINT: unimplemented - should be paginated
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -83,6 +85,7 @@ fn app(
                         .route("/{name}/archive", web::get().to(handlers::archive_source))
                         // TODO(15): ENDPOINT: Entries that have this as source 1 or source 2
                         //  (?primary_only should be possible in request)
+                        //  should be paginated
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -95,7 +98,7 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_category_by_name))
                         .route("/{name}", web::post().to(handlers::update_category))
                         .route("/{name}/archive", web::get().to(handlers::archive_category))
-                        // TODO(15): ENDPOINT: unimplemented
+                        // TODO(15): ENDPOINT: unimplemented - should be paginated
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -109,8 +112,9 @@ fn app(
                         // sum-per-category-per-month
                         .route("", web::get().to(handlers::find_entries))
                         // Parameters: ids
-                        // TODO(12): ENDPOINT: unimplemented
-                        .route("/update", web::post().to(handlers::unimplemented))
+                        // TODO(12): ENDPOINT: unimplemented - Use UpdateEntryRequest, but also
+                        //  update source amounts same as deletion
+                        .route("/update", web::post().to(handlers::update_entry))
                         // Parameters: ids
                         .route("", web::delete().to(handlers::delete_entries))
                         .route("/archive", web::get().to(handlers::archive_entries)),
@@ -131,15 +135,15 @@ mod tests {
     use std::fmt::Debug;
     use std::pin::Pin;
 
+    use actix_http::Request;
     use actix_http::body::MessageBody;
     use actix_http::error::PayloadError;
-    use actix_http::Request;
     use actix_web::dev::ServiceResponse;
     use actix_web::http::{Method, StatusCode};
     use actix_web::test as at;
     use diesel::prelude::*;
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::{DeserializeOwned, StdError};
     use serde_json::json;
     use tokio::sync::OnceCell;
 
@@ -149,9 +153,9 @@ mod tests {
         CategoryResponse, CurrencyResponse, EntryQuery, EntryResponse, SourceResponse,
     };
 
-    static TEST_USERNAME: &'static str = "root";
-    static TEST_PASSWORD: &'static str = "root";
-    static TEST_CURRENCY: &'static str = "USD";
+    static TEST_USERNAME: &str = "root";
+    static TEST_PASSWORD: &str = "root";
+    static TEST_CURRENCY: &str = "USD";
 
     struct TestResponse<T: DeserializeOwned + Serialize> {
         pub status_code: StatusCode,
@@ -193,10 +197,10 @@ mod tests {
         T: DeserializeOwned + Serialize + Debug,
         B: MessageBody,
         S: actix_web::dev::Service<
-            Request<Pin<Box<dyn futures::Stream<Item = Result<web::Bytes, PayloadError>>>>>,
-            Response = ServiceResponse<B>,
-            Error = actix_web::Error,
-        >,
+                Request<Pin<Box<dyn futures::Stream<Item = Result<web::Bytes, PayloadError>>>>>,
+                Response = ServiceResponse<B>,
+                Error = actix_web::Error,
+            >,
     {
         let mut req = at::TestRequest::default().method(method).uri(uri);
         if let Some(t) = token {
@@ -212,7 +216,20 @@ mod tests {
         unsafe {
             match res.status() {
                 StatusCode::OK => {
-                    let res_struct = at::read_body_json::<T, B>(res).await;
+                    // This logic is the same as read_body_json, but we can place an intermediate
+                    // debug statement when it's a string.
+                    let body = at::read_body(res).await;
+                    // let dbg_val = dbg!(String::from_utf8(body.to_vec()).unwrap()); // We can use
+                    // this to debug.
+                    let res_struct = serde_json::from_slice(&body)
+                        .map_err(Into::<Box<dyn StdError>>::into)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "could not deserialize body into a {}\nerr: {}",
+                                std::any::type_name::<T>(),
+                                err,
+                            )
+                        });
                     TestResponse {
                         status_code,
                         body_string: serde_json::to_string(&res_struct).expect(
@@ -234,6 +251,7 @@ mod tests {
     /// 1. Deletes the user (in case it already exists from a previous test run).
     /// 2. Creates a user.
     /// 3. Logs in and returns the token.
+    ///
     /// Sends requests to three endpoints. Asserts that the delete endpoint returned success or
     /// not-found, and that the create and login endpoints returned success. This is set up this way
     /// to allow for setup without having to use something like
@@ -241,7 +259,7 @@ mod tests {
     /// achievable using custom frameworks, is not necessary.
     async fn token() -> &'static str {
         async fn once() -> String {
-            let app = at::init_service(app(&pool())).await;
+            let app = at::init_service(app(pool())).await;
 
             let res: TestResponse<EmptyResponse> = run_req(
                 &app,
@@ -280,14 +298,18 @@ mod tests {
         TOKEN.get_or_init(once).await.as_str()
     }
 
-    fn delete_direct<T>(pool: &Pool, q: T)
+    async fn delete_direct<T>(pool: &Pool, q: T)
     where
-        T: diesel::query_builder::IntoUpdateTarget,
+        T: diesel::query_builder::IntoUpdateTarget + Send,
         diesel::query_builder::DeleteStatement<T::Table, T::WhereClause>:
-            diesel::query_builder::QueryFragment<diesel::pg::Pg> + diesel::query_builder::QueryId,
+            diesel::query_builder::QueryFragment<diesel::pg::Pg>
+                + diesel::query_builder::QueryId
+                + Send,
     {
-        let mut conn = pool.get().expect("Failed to get database connection");
-        diesel::delete(q).execute(&mut conn).expect("Failed to run the delete query you specified");
+        let mut conn = pool.get().await.expect("Failed to get database connection");
+        diesel_async::RunQueryDsl::execute(diesel::delete(q), &mut conn)
+            .await
+            .expect("Failed to run the delete query you specified");
     }
 
     #[actix_web::test]
@@ -298,12 +320,12 @@ mod tests {
         // Cleanup
         {
             use crate::schema::currencies::dsl::*;
-            delete_direct(&pool(), currencies.filter(name.eq("EUR")));
+            delete_direct(&pool(), currencies.filter(name.eq("EUR"))).await;
         }
 
         // Get token
         let t = Some(token().await);
-        let app = at::init_service(app(&pool())).await;
+        let app = at::init_service(app(pool())).await;
 
         // Create currency
         let res: TestResponse<EmptyResponse> = run_req(
@@ -368,16 +390,16 @@ mod tests {
         // Cleanup
         {
             use crate::schema::sources::dsl::*;
-            delete_direct(&pool(), sources.filter(name.eq("SavingsAccount")));
+            delete_direct(&pool(), sources.filter(name.eq("SavingsAccount"))).await;
         }
         {
             use crate::schema::currencies::dsl::*;
-            delete_direct(&pool(), currencies.filter(name.eq("GBP")));
+            delete_direct(&pool(), currencies.filter(name.eq("GBP"))).await;
         }
 
         // Get token
         let t = Some(token().await);
-        let app = at::init_service(app(&pool())).await;
+        let app = at::init_service(app(pool())).await;
 
         // Create currency for the source
         let res: TestResponse<EmptyResponse> = run_req(
@@ -390,7 +412,7 @@ mod tests {
         .await;
         assert_response_status_is_success(&res);
 
-        // Create source
+        // Create a source
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
@@ -401,14 +423,14 @@ mod tests {
         .await;
         assert_response_status_is_success(&res);
 
-        // Get source
+        // Get a source
         let res: TestResponse<SourceResponse> =
             run_req(&app, Method::GET, "/api/source/SavingsAccount", t, None).await;
         assert_response_status_is_success(&res);
         let name = res.body.expect("expected body to be set on 200").name;
         assert_eq!(name, "SavingsAccount", "source name should be 'SavingsAccount'");
 
-        // Update source
+        // Update a source
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
@@ -440,7 +462,7 @@ mod tests {
             run_req(&app, Method::GET, "/api/source/SavingsAccount/archive", t, None).await;
         assert_response_status_is_success(&res);
 
-        // Confirm update and archive of source
+        // Confirm update and archive of a source
         let res: TestResponse<SourceResponse> =
             run_req(&app, Method::GET, "/api/source/SavingsAccount", t, None).await;
         assert_response_status_is_success(&res);
@@ -458,13 +480,13 @@ mod tests {
         // Cleanup
         {
             use crate::schema::categories::dsl::*;
-            delete_direct(&pool(), categories.filter(name.eq("RentAndBillsT")));
-            delete_direct(&pool(), categories.filter(name.eq("RecurringExpensesT")));
+            delete_direct(&pool(), categories.filter(name.eq("RentAndBillsT"))).await;
+            delete_direct(&pool(), categories.filter(name.eq("RecurringExpensesT"))).await;
         }
 
         // Get token
         let t = Some(token().await);
-        let app = at::init_service(app(&pool())).await;
+        let app = at::init_service(app(pool())).await;
 
         // Create category
         let res: TestResponse<EmptyResponse> =
@@ -506,48 +528,37 @@ mod tests {
 
     #[actix_web::test]
     async fn test_entries_lifecycle() {
-        // Cleanup: Delete currencies, categories, sources, and entries if they already exist
+        // 0. Cleanup: Delete currencies, categories, sources, and entries if they already exist
         {
             use crate::schema::entries::dsl::*;
-
-            delete_direct(&pool(), entries);
+            delete_direct(&pool(), entries).await;
         }
         {
             use crate::schema::categories::dsl::*;
-
-            delete_direct(&pool(), categories.filter(name.eq("RecurringExpenses")));
-            delete_direct(&pool(), categories.filter(name.eq("LivingExpenses")));
-            delete_direct(&pool(), categories.filter(name.eq("Purchases")));
-            delete_direct(&pool(), categories.filter(name.eq("Entertainment")));
+            delete_direct(&pool(), categories).await;
         }
         {
             use crate::schema::sources::dsl::*;
-            delete_direct(&pool(), sources.filter(name.eq("USDBankAccount")));
-            delete_direct(&pool(), sources.filter(name.eq("USDWallet")));
-            delete_direct(&pool(), sources.filter(name.eq("EGPBankAccount")));
-            delete_direct(&pool(), sources.filter(name.eq("EGPWallet")));
-            delete_direct(&pool(), sources.filter(name.eq("JPYBankAccount")));
-            delete_direct(&pool(), sources.filter(name.eq("JPYWallet")));
+            delete_direct(&pool(), sources).await;
         }
         {
             use crate::schema::currencies::dsl::*;
-            delete_direct(&pool(), currencies.filter(name.eq("EGP")));
-            delete_direct(&pool(), currencies.filter(name.eq("JPY")));
+            delete_direct(&pool(), currencies).await;
         }
 
         // Get token and app service
         let t = Some(token().await);
-        let app = at::init_service(app(&pool())).await;
+        let app = at::init_service(app(pool())).await;
 
         // 1. Create Currencies: EGP and JPY
-        let currencies = vec!["EGP", "JPY"];
-        for &currency in &currencies {
+        let currencies = vec![("EGP", 0.02), ("JPY", 0.00667)];
+        for &(currency, rtf) in &currencies {
             let res: TestResponse<EmptyResponse> = run_req(
                 &app,
                 Method::POST,
                 "/api/currency",
                 t,
-                Some(json!({ "name": currency, "rate_to_fixed": 1.0 })),
+                Some(json!({ "name": currency, "rate_to_fixed": rtf })),
             )
             .await;
             assert_response_status_is_success(&res);
@@ -563,15 +574,16 @@ mod tests {
         }
 
         // 3. Create Sources for each currency (USD, EGP, JPY)
+        // Final amounts before archival and deletion are included.
         let source_data = vec![
-            ("USDBankAccount", "USD"),
-            ("USDWallet", "USD"),
-            ("EGPBankAccount", "EGP"),
-            ("EGPWallet", "EGP"),
-            ("JPYBankAccount", "JPY"),
-            ("JPYWallet", "JPY"),
+            ("USDBankAccount", "USD", 915.0),
+            ("USDWallet", "USD", 1080.0),
+            ("EGPBankAccount", "EGP", 40250.0),
+            ("EGPWallet", "EGP", 60750.0),
+            ("JPYBankAccount", "JPY", 142079.160419),
+            ("JPYWallet", "JPY", 179410.044977),
         ];
-        for &(source, currency) in &source_data {
+        for &(source, currency, _) in &source_data {
             let res: TestResponse<EmptyResponse> = run_req(
                 &app,
                 Method::POST,
@@ -600,7 +612,7 @@ mod tests {
             })),
         )
         .await;
-        // Converts without second source should throw bad request
+        // Converts without a second source should throw bad request
         assert_response_status(&res, StatusCode::BAD_REQUEST);
         assert!(&res.body_string.contains("Malformed CreateEntryRequest"));
 
@@ -635,26 +647,33 @@ mod tests {
         }
         #[rustfmt::skip]
         let entries_data = vec![
-            ("Borrow",   65.0, "USD", "USDBankAccount", Some("Relative"),       None,                   None,          "Entertainment",     "2023-02-01", Expected::Success),
-            ("Convert", 400.0, "EGP", "USDWallet",      None,                   Some("JPYWallet"),      Some(61877.0), "RecurringExpenses", "2023-03-01", Expected::BadRequest), // EGP currency in this entry should be ignored in favor of secondary source's JPY
-            ("Spend",    90.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-04-01", Expected::Success),
-            ("Income",  200.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
-            ("Lend",     75.0, "USD", "EGPBankAccount", Some("Associate"),      None,                   None,          "LivingExpenses",    "2023-06-01", Expected::Success),
-            ("Borrow",   85.0, "USD", "EGPWallet",      Some("Partner"),        None,                   None,          "Purchases",         "2023-07-01", Expected::Success),
-            ("Convert", 500.0, "JPY", "JPYWallet",      None,                   Some("JPYBankAccount"), Some(400.0),   "Entertainment",     "2023-08-01", Expected::Success), // This conversion should just lose me money, but it should be valid
-            ("Spend",   100.0, "USD", "USDBankAccount", None,                   None,                   None,          "LivingExpenses",    "2023-01-01", Expected::Success),
-            ("Income",  200.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-02-01", Expected::Success),
-            ("Lend",     50.0, "USD", "USDBankAccount", Some("John Doe"),       None,                   None,          "Purchases",         "2023-03-01", Expected::Success),
-            ("Borrow",   75.0, "USD", "USDWallet",      Some("Jane Doe"),       None,                   None,          "Entertainment",     "2023-04-01", Expected::Success),
+            // Start with 1k usd worth of currency in each source, jpy is 149925.037481, egp is 50000
+            ("Income", 1000.0, "USD", "JPYBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
+            ("Income", 1000.0, "USD", "EGPBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
+            ("Income", 1000.0, "USD", "USDBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
+            ("Income", 1000.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
+            ("Income", 1000.0, "USD", "EGPWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
+            ("Income", 1000.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
+            ("Borrow",   65.0, "USD", "USDBankAccount", Some("Relative"),       None,                   None,          "Entertainment",     "2023-02-01", Expected::Success), // USDBankAccount 1065 - Gets archived
+            ("Convert", 400.0, "EGP", "USDWallet",      None,                   Some("JPYWallet"),      Some(61877.0), "RecurringExpenses", "2023-03-01", Expected::BadRequest), // The EGP currency in this entry is ambiguous
+            ("Spend",    90.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-04-01", Expected::Success), // JPYBankAccount 136431.784108
+            ("Income",  200.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success), // JPYWallet 179910.044977
+            ("Lend",     75.0, "USD", "EGPBankAccount", Some("Associate"),      None,                   None,          "LivingExpenses",    "2023-06-01", Expected::Success), // EGPBankAccount 46250
+            ("Borrow",   85.0, "USD", "EGPWallet",      Some("Partner"),        None,                   None,          "Purchases",         "2023-07-01", Expected::Success), // EGPWallet 54250
+            ("Convert", 500.0, "JPY", "JPYWallet",      None,                   Some("JPYBankAccount"), Some(400.0),   "Entertainment",     "2023-08-01", Expected::Success), // JPYWallet 179410.044977 JPYBankAccount 136831.784108 - This conversion should just lose me money, but it should be valid
+            ("Spend",   100.0, "USD", "USDBankAccount", None,                   None,                   None,          "LivingExpenses",    "2023-01-01", Expected::Success), // USDBankAccount 965 - Gets archived
+            ("Income",  200.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-02-01", Expected::Success), // USDWallet 1200 - Gets deleted
+            ("Lend",     50.0, "USD", "USDBankAccount", Some("John Doe"),       None,                   None,          "Purchases",         "2023-03-01", Expected::Success), // USDBankAccount 915 - Gets deleted
+            ("Borrow",   75.0, "USD", "USDWallet",      Some("Jane Doe"),       None,                   None,          "Entertainment",     "2023-04-01", Expected::Success), // USDWallet 1275
             ("Convert", 500.0, "USD", "USDBankAccount", None,                   Some("EGPWallet"),      None,          "LivingExpenses",    "2023-05-01", Expected::BadRequest), // Convert without secondary source amount
-            ("Spend",   120.0, "USD", "EGPBankAccount", None,                   None,                   None,          "Purchases",         "2023-06-01", Expected::Success),
-            ("Income",  130.0, "USD", "EGPWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-07-01", Expected::Success),
-            ("Lend",     80.0, "USD", "JPYBankAccount", Some("Friend"),         None,                   None,          "Entertainment",     "2023-08-01", Expected::Success),
+            ("Spend",   120.0, "USD", "EGPBankAccount", None,                   None,                   None,          "Purchases",         "2023-06-01", Expected::Success), // EGPBankAccount 40250
+            ("Income",  130.0, "USD", "EGPWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-07-01", Expected::Success), // EGPWallet 60750
+            ("Lend",     80.0, "USD", "JPYBankAccount", Some("Friend"),         None,                   None,          "Entertainment",     "2023-08-01", Expected::Success), // JPYBankAccount 124837.781109
             ("Borrow",   90.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-09-01", Expected::BadRequest), // Borrow / lend needs target
             ("Convert", 200.0, "JPY", "JPYWallet",      None,                   Some("EGPBankAccount"), None,          "Purchases",         "2023-10-01", Expected::BadRequest), // Secondary source amount required on convert
-            ("Spend",   110.0, "USD", "USDWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-11-01", Expected::Success),
-            ("Income",  115.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-12-01", Expected::Success),
-            ("Lend",     85.0, "USD", "USDWallet",      Some("Neighbor"),       None,                   None,          "Purchases",         "2024-01-01", Expected::Success),
+            ("Spend",   110.0, "USD", "USDWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-11-01", Expected::Success), // USDWallet 1165
+            ("Income",  115.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-12-01", Expected::Success), // JPYBankAccount 142079.160419
+            ("Lend",     85.0, "USD", "USDWallet",      Some("Neighbor"),       None,                   None,          "Purchases",         "2024-01-01", Expected::Success), // USDWallet 1080
         ];
 
         for (
@@ -669,7 +688,7 @@ mod tests {
                 secondary_source_amount,
                 category,
                 date,
-                expected
+                expected,
             ),
         ) in entries_data.into_iter().enumerate()
         {
@@ -697,18 +716,69 @@ mod tests {
                 Expected::BadRequest => assert_response_status(&res, StatusCode::BAD_REQUEST),
             }
         }
-        // TODO(09): Assert that auto-convert happens, assert that currency is ignored in favor of
-        //  second source in case of convert, assert that all converts succeed and are sound,
-        //  assert final values of sources
 
-        // 5. Get all entries and ensure the count is 16 - the other 4 are bad requests
+        // 5. Assert sources after entry creation but before archival and deletion.
+        for &(source, _, final_amount) in &source_data {
+            let res: TestResponse<SourceResponse> =
+                run_req(&app, Method::GET, format!("/api/source/{source}").as_str(), t, None).await;
+            assert_response_status_is_success(&res);
+            let amount = res.body.expect("expected body to be set on 200").amount;
+            assert!(
+                approx::abs_diff_eq!(amount, final_amount, epsilon = 0.001),
+                "{source}: expected final_amount to be {final_amount} found {amount}"
+            );
+        }
+
+        // 6. Get all entries and ensure the count is 22 - the other 4 are bad requests
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/entry/all", t, None).await;
         assert_response_status_is_success(&res);
         let all_entries = res.body.expect("Expected entries in response");
-        assert_eq!(all_entries.len(), 16, "Expected 20 entries initially");
+        assert_eq!(all_entries.len(), 22, "Expected 22 entries initially");
 
-        // 6. Archive 2 entries and delete 2 entries
+        // 7. Use find entries with different filters and verify results
+        #[rustfmt::skip]
+        let filters: Vec<(EntryQuery, i32)> = vec![
+            (EntryQuery { amount: Some(90.0), ..Default::default() }, -1),
+            // The other 90 is a bad request
+            (EntryQuery { amount: Some(90.0), currency: Some("USD".to_string()), ..Default::default() }, 1),
+            (EntryQuery { min_amount: Some(80.0), currency: Some("USD".to_string()), ..Default::default() }, 17),
+            // The following two ensure converts work
+            (EntryQuery { max_amount: Some(120.0), currency: Some("USD".to_string()), ..Default::default() }, 12),
+            (EntryQuery { max_amount_in_fixed: Some(120.0), ..Default::default() }, 13),
+            (EntryQuery { currencies: Some(vec!["EGP".to_string()]), ..Default::default() }, 0),
+            (EntryQuery { currencies: Some(vec!["JPY".to_string()]), ..Default::default() }, 1),
+                // could not deserialize body into a money_rs::handlers::FindEntriesResponse
+                // err: invalid type: null, expected f64 at line 1 column 42
+            (EntryQuery { sources: Some(vec!["JPYBankAccount".to_string()]), ..Default::default()}, 4),
+        ];
+        let filters_qs =
+            filters.into_iter().map(|o| (serde_qs::to_string::<EntryQuery>(&o.0), o.1));
+
+        for (filter, expected_count) in filters_qs {
+            let filter = filter.expect("Filter should always succeed in serializing");
+            let res: TestResponse<FindEntriesResponse> =
+                run_req(&app, Method::GET, format!("/api/entry?{filter}").as_str(), t, None).await;
+            if expected_count < 0 {
+                assert_response_status(&res, StatusCode::BAD_REQUEST);
+                continue;
+            }
+
+            assert_response_status_is_success(&res);
+            let filtered_entries = res.body.expect("Expected filtered entries");
+            // dbg!(json!(filtered_entries));
+            assert_eq!(
+                filtered_entries.entries.len(),
+                expected_count as usize,
+                "Unexpected entry count {} for filter {} - expected {}",
+                filtered_entries.entries.len(),
+                filter,
+                expected_count
+            );
+        }
+
+        // 8. Archive 2 entries and delete 2 entries
+        // This will always archive 6 and 13 due to their date
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::GET,
@@ -719,6 +789,7 @@ mod tests {
         .await;
         assert_response_status_is_success(&res);
 
+        // This will always delete 7 and 14 due to their date
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::DELETE,
@@ -729,45 +800,26 @@ mod tests {
         .await;
         assert_response_status_is_success(&res);
 
-        // 7. Ensure count is now 14 and 2 archived entries
+        // 9. Ensure count is now 20 and 2 archived entries
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/entry/all", t, None).await;
         assert_response_status_is_success(&res);
         let body = res.body.expect("Expected entries in response");
-        assert_eq!(body.len(), 14, "Expected 18 entries after deletion");
+        assert_eq!(body.len(), 20, "Expected 20 entries after deletion");
         assert_eq!(body.iter().filter(|o| o.archived).count(), 2, "Expected 2 archived entries");
 
-        // 8. Use find entries with different filters and verify results
-        #[rustfmt::skip]
-        let filters = vec![
-            (EntryQuery { amount: Some(90.0), ..Default::default() }, 2),
-            (EntryQuery { min_amount: Some(80.0), ..Default::default() }, 16),
-            (EntryQuery { max_amount: Some(120.0), ..Default::default() }, 13),
-            (EntryQuery { currencies: Some(vec!["EGP".to_string()]), ..Default::default() }, 5),
-            (EntryQuery { sources: Some(vec!["JPYBankAccount".to_string()]), ..Default::default()}, 3),
-        ];
-        let filters_qs =
-            filters.into_iter().map(|o| (serde_qs::to_string::<EntryQuery>(&o.0), o.1));
-
-        for (filter, expected_count) in filters_qs {
-            let filter = filter.expect("Filter should always succeed in serializing");
-            let res: TestResponse<FindEntriesResponse> =
-                run_req(&app, Method::GET, format!("/api/entry?{filter}").as_str(), t, None).await;
+        // 10. Ensure that sources with deleted entries get their amounts returned
+        for (source, final_amount) in vec![("USDWallet", 880.0), ("USDBankAccount", 965.0)] {
+            let res: TestResponse<SourceResponse> =
+                run_req(&app, Method::GET, format!("/api/source/{source}").as_str(), t, None).await;
             assert_response_status_is_success(&res);
-            let filtered_entries = res.body.expect("Expected filtered entries");
-            dbg!(json!(filtered_entries));
-            assert_eq!(
-                filtered_entries.entries.len(),
-                expected_count,
-                "Unexpected entry count {} for filter {} - expected {}",
-                filtered_entries.entries.len(),
-                filter,
-                expected_count
+            let amount = res.body.expect("expected body to be set on 200").amount;
+            assert!(
+                approx::abs_diff_eq!(amount, final_amount, epsilon = 0.001),
+                "{source}: expected final_amount to be {final_amount} found {amount}"
             );
         }
 
-        // TODO(30): TEST: More filters, auto-convert from source if another currency specified,
-        //  bulk delete entries (should also assert returns money to sources).
         // TODO(40): TEST: Test newly implemented endpoints:
         //  - Get currency's entries
         //  - Get source's entries

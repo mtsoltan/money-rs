@@ -4,13 +4,14 @@ use actix_web::dev::ServiceRequest;
 use actix_web::http::StatusCode;
 use actix_web::{Error, HttpMessage, ResponseError};
 use actix_web_httpauth::extractors::bearer::BearerAuth;
-use diesel::{QueryDsl as _, RunQueryDsl as _};
+use diesel::QueryDsl;
+use diesel_async::RunQueryDsl as _;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
+use crate::AppState;
 use crate::env_vars::jwt_secret;
 use crate::model::User;
-use crate::AppState;
 
 #[derive(thiserror::Error, Debug)]
 enum AuthenticationError {
@@ -96,12 +97,16 @@ pub async fn jwt_validator_generator(
                 return Err((Error::from(AuthenticationError::TokenExpired), req));
             }
 
-            let find_result: Result<User, _> = users.find(login_claims.user_id).first(
-                &mut req
-                    .app_data::<actix_web::web::Data<AppState>>()
-                    .expect("AppState should be defined")
-                    .cpool(),
-            );
+            let find_result: Result<User, _> = users
+                .find(login_claims.user_id)
+                .first(
+                    &mut req
+                        .app_data::<actix_web::web::Data<AppState>>()
+                        .expect("AppState should be defined")
+                        .cpool()
+                        .await,
+                )
+                .await;
             match find_result {
                 Ok(user) => {
                     req.extensions_mut().insert(user);

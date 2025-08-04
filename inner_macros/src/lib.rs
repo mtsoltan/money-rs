@@ -1,12 +1,10 @@
-#![feature(let_chains)]
-
 extern crate proc_macro2;
 
 use proc_macro2::{Ident, Span};
 use proc_macro2_diagnostics::{Diagnostic, Level};
 use quote::quote;
 use syn::spanned::Spanned;
-use syn::{parse2, parse_quote, DeriveInput, Expr, Type};
+use syn::{DeriveInput, Expr, Type, parse_quote, parse2};
 
 fn is_option_type(ty: &Type) -> bool {
     if let Type::Path(path) = ty {

@@ -6,7 +6,9 @@ use env_logger::Env;
 #[cfg(not(test))]
 pub fn init() {
     dotenv::from_filename(".env").ok();
-    set_var("RUST_LOG", "actix_web=debug");
+    unsafe {
+        set_var("RUST_LOG", "actix_web=debug");
+    }
     init_logger();
     database_url();
     jwt_secret();
@@ -15,7 +17,9 @@ pub fn init() {
 #[cfg(test)]
 pub fn init() {
     dotenv::from_filename("test.env").ok();
-    set_var("RUST_LOG", "actix_web=debug");
+    unsafe {
+        set_var("RUST_LOG", "actix_web=debug");
+    }
     init_logger();
     database_url();
     jwt_secret();

@@ -3,9 +3,11 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use ::pbkdf2::Pbkdf2;
-use actix_web::{web, HttpRequest, HttpResponse};
-use diesel::insert_into;
-use diesel::prelude::*;
+use actix_web::{HttpRequest, HttpResponse, web};
+use diesel::query_dsl::methods::{FilterDsl, OrderDsl, SelectDsl};
+use diesel::{BelongingToDsl, ExpressionMethods, SelectableHelper, insert_into};
+use diesel_async::scoped_futures::ScopedFutureExt;
+use diesel_async::{AsyncConnection, RunQueryDsl as _};
 use futures::future::join_all;
 use itertools::Itertools;
 use log::error;
@@ -13,10 +15,12 @@ use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
 
 use crate::consts;
-use crate::http::{internal, ArrayQuery};
+use crate::consts::Conn;
+use crate::http::{ArrayQuery, internal};
 use crate::model::{EntryType, GetById};
 #[allow(unused_imports)]
 use crate::{
+    AppState,
     model::{
         Category, CategoryResponse, CreateCategoryRequest, CreateCurrencyRequest,
         CreateEntryRequest, CreateSourceRequest, Currency, CurrencyResponse, Entry, EntryQuery,
@@ -25,12 +29,11 @@ use crate::{
         UpdateCategoryRequest, UpdateCurrency, UpdateCurrencyRequest, UpdateEntry,
         UpdateEntryRequest, UpdateSource, UpdateSourceRequest, User,
     },
-    AppState,
 };
 
 // We cannot skip serialization in any of the fields in the response, as in the tests,
 // we will need to reconstruct the response from the JSON string to reason about it,
-// in order to not have to write code that uses maps.
+// to not have to write code that uses maps.
 //
 // The exception is CreateResponse, which serializes as empty response.
 
@@ -51,6 +54,7 @@ pub struct CountResponse {
     pub count: usize,
 }
 
+#[cfg(any(test, feature = "create_user"))]
 #[derive(thiserror::Error, Debug)]
 pub enum ExternalServiceError {
     #[error("Failed to generate password hash")]
@@ -59,6 +63,7 @@ pub enum ExternalServiceError {
     DieselError(#[from] diesel::result::Error),
 }
 
+#[cfg(any(test, feature = "create_user"))]
 impl From<password_hash::Error> for ExternalServiceError {
     fn from(value: password_hash::Error) -> Self { Self::HashError(value) }
 }
@@ -89,7 +94,8 @@ pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>
 
     let mut items = users
         .filter(username.eq(&data.username))
-        .load::<User>(&mut app_state.cpool())
+        .load::<User>(&mut app_state.cpool().await)
+        .await
         .unwrap_or(vec![]);
 
     if items.is_empty() {
@@ -130,6 +136,7 @@ pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>
     }
 }
 
+#[cfg(any(test, feature = "create_user"))]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
@@ -154,15 +161,16 @@ pub async fn create_user(
         // Salt::RECOMMENDED_LENGTH would fail because of equal signs.
         // See https://docs.rs/password-hash/latest/src/password_hash/salt.rs.html#122
         let mut bytes: [u8; 12] = [0; 12];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        let base64_string = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        rand::rng().fill_bytes(&mut bytes);
+        let base64_string = base64::engine::general_purpose::STANDARD.encode(bytes);
         let generated_salt =
             Salt::from_b64(base64_string.as_str()).expect("Salt construction should work");
-        let hash = PasswordHash::generate(Pbkdf2, &data.password.as_bytes(), generated_salt)?;
+        let hash = PasswordHash::generate(Pbkdf2, data.password.as_bytes(), generated_salt)?;
 
         let user = insert_into(users)
             .values(NewUser { password: hash.to_string(), username: data.username.to_string() })
-            .get_result::<User>(&mut app_state.cpool())?;
+            .get_result::<User>(&mut app_state.cpool().await)
+            .await?;
         insert_into(currencies)
             .values(NewCurrency {
                 user_id: user.id,
@@ -171,7 +179,8 @@ pub async fn create_user(
                 rate_to_fixed: 1.0f64,
                 archived: None,
             })
-            .execute(&mut app_state.cpool())?;
+            .execute(&mut app_state.cpool().await)
+            .await?;
 
         user
     };
@@ -190,8 +199,9 @@ pub async fn delete_user(
 ) -> HttpResponse {
     use crate::schema::users::dsl::*;
     let path_username = path_username.into_inner();
-    let deleted_count =
-        diesel::delete(users.filter(username.eq(path_username))).execute(&mut app_state.cpool());
+    let deleted_count = diesel::delete(users.filter(username.eq(path_username)))
+        .execute(&mut app_state.cpool().await)
+        .await;
 
     match deleted_count {
         Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
@@ -223,13 +233,16 @@ macro_rules! create_handler {
                 data.into_inner(),
                 &user.into_inner(),
                 app_state.clone().into_inner(),
-            );
+            )
+            .await;
             let creatable = match creatable {
                 Err(e) => return HttpResponse::from(e),
                 Ok(c) => c,
             };
-            let created =
-                insert_into($tb_name).values(creatable).get_result::<$ent>(&mut app_state.cpool());
+            let created = insert_into($tb_name)
+                .values(creatable)
+                .get_result::<$ent>(&mut app_state.cpool().await)
+                .await;
             match created {
                 Ok(c) => HttpResponse::Ok().json(CreateResponse { id: c.id }),
                 Err(e) => {
@@ -267,55 +280,105 @@ pub async fn create_entry(
         data.into_inner(),
         &user.into_inner(),
         app_state.clone(),
-    );
+    )
+    .await;
     let creatable = match creatable {
         Err(e) => return HttpResponse::from(e),
         Ok(c) => c,
     };
 
-    let created =
-        insert_into(dsl::entries).values(creatable).get_result::<Entry>(&mut app_state.cpool());
+    let conn = &mut app_state.cpool().await;
 
-    let created = match created {
-        Ok(c) => c,
-        Err(e) => return if matches!(
-            e,
-            diesel::result::Error::DatabaseError(
-                diesel::result::DatabaseErrorKind::UniqueViolation,
-                _
-            )
-        ) {
-            HttpResponse::BadRequest()
-                .body(format!("{} already exists", Entry::specifier()))
-        } else {
-            internal(e, format!("E014: Failed to create {}", Entry::specifier()))
-        }
-    };
+    enum TransactionError {
+        // BadRequest gives a static error message that overlooks the underlying error due to
+        // check
+        #[allow(dead_code)]
+        BadRequestAlreadyExists(diesel::result::Error),
+        InternalE014(diesel::result::Error),
+        InternalE018(UpdateEntrySourcesError, String),
+        TransactionError(diesel::result::Error),
+    }
 
-    let source_result =
-        update_entry_sources(&created, app_state.clone(), UpdateEntrySourcesType::Create).await;
-    match source_result {
-        Err(e) => {
-            let (eid, sid) = match e {
-                UpdateEntrySourcesError::NoSource { entry_id, source_id, .. } => (entry_id, source_id),
-                UpdateEntrySourcesError::MalformedEntry { entry_id, source_id } => (entry_id, source_id),
-                UpdateEntrySourcesError::UpdateError { entry_id, source_id, .. } => (entry_id, source_id),
-            };
-            let error_string = format!(
-                "E018: Successfully created {} {}, but failed to get {} {:?} for it",
-                Entry::specifier(),
-                eid,
-                Source::specifier(),
-                sid,
-            );
-            internal(e, error_string)
-        }
-        Ok(_) => HttpResponse::Ok().json(CreateResponse { id: created.id }),
+    impl From<diesel::result::Error> for TransactionError {
+        fn from(value: diesel::result::Error) -> Self { TransactionError::TransactionError(value) }
+    }
+
+    match conn
+        .transaction(|tx| {
+            async move {
+                let created =
+                    insert_into(dsl::entries).values(creatable).get_result::<Entry>(tx).await;
+
+                let created = match created {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return if matches!(
+                            e,
+                            diesel::result::Error::DatabaseError(
+                                diesel::result::DatabaseErrorKind::UniqueViolation,
+                                _
+                            )
+                        ) {
+                            Err(TransactionError::BadRequestAlreadyExists(e))
+                        } else {
+                            Err(TransactionError::InternalE014(e))
+                        };
+                    }
+                };
+                let source_result = update_entry_sources(
+                    &created,
+                    app_state.clone(),
+                    tx,
+                    UpdateEntrySourcesType::Create,
+                )
+                .await;
+                match source_result {
+                    Err(e) => {
+                        let (eid, sid) = match e {
+                            UpdateEntrySourcesError::NoSource { entry_id, source_id, .. } => {
+                                (entry_id, source_id)
+                            }
+                            UpdateEntrySourcesError::MalformedEntry { entry_id, source_id } => {
+                                (entry_id, source_id)
+                            }
+                            UpdateEntrySourcesError::UpdateError {
+                                entry_id, source_id, ..
+                            } => (entry_id, source_id),
+                        };
+                        let error_string = format!(
+                            "E018: Successfully created {} {}, but failed to get {} {:?} for it",
+                            Entry::specifier(),
+                            eid,
+                            Source::specifier(),
+                            sid,
+                        );
+                        Err(TransactionError::InternalE018(e, error_string))
+                    }
+                    Ok(_) => Ok(CreateResponse { id: created.id }),
+                }
+            }
+            .scope_boxed()
+        })
+        .await
+    {
+        Err(e) => match e {
+            TransactionError::BadRequestAlreadyExists(_) => {
+                HttpResponse::BadRequest().body(format!("{} already exists", Entry::specifier()))
+            }
+            TransactionError::InternalE014(e) => {
+                internal(e, format!("E014: Failed to create {}", Entry::specifier()))
+            }
+            TransactionError::InternalE018(e, error_string) => internal(e, error_string),
+            TransactionError::TransactionError(e) => {
+                internal(e, "E019: Internal transaction error")
+            }
+        },
+        Ok(e) => HttpResponse::Ok().json(e),
     }
 }
 
 macro_rules! get_all_handler {
-    ($fn_name:ident, $ent:ident, $resp:ident) => {
+    ($fn_name:ident, $ent:ident, $resp:ident, $order:expr) => {
         pub async fn $fn_name(
             _req: HttpRequest,
             app_state: web::Data<AppState>,
@@ -325,7 +388,9 @@ macro_rules! get_all_handler {
             let app_state = app_state.into_inner();
             let fetched = match $ent::belonging_to(&user)
                 .select($ent::as_select())
-                .load(&mut app_state.cpool())
+                .order($order)
+                .load(&mut app_state.cpool().await)
+                .await
             {
                 Err(e) => {
                     return internal(
@@ -335,10 +400,14 @@ macro_rules! get_all_handler {
                 }
                 Ok(f) => f,
             };
-            let responses = fetched
-                .into_iter()
-                .map(|f| $resp::stateful_try_from(f, &user, app_state.clone()))
-                .collect::<Result<Vec<$resp>, _>>();
+            let responses = join_all(
+                fetched
+                    .into_iter()
+                    .map(async |f| $resp::stateful_try_from(f, &user, app_state.clone()).await),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<$resp>, _>>();
 
             match responses {
                 Err(e) => HttpResponse::from(e),
@@ -348,10 +417,29 @@ macro_rules! get_all_handler {
     };
 }
 
-get_all_handler!(get_currencies, Currency, CurrencyResponse);
-get_all_handler!(get_sources, Source, SourceResponse);
-get_all_handler!(get_categories, Category, CategoryResponse);
-get_all_handler!(get_entries, Entry, EntryResponse);
+get_all_handler!(
+    get_currencies,
+    Currency,
+    CurrencyResponse,
+    crate::schema::currencies::dsl::id.asc()
+);
+get_all_handler!(get_sources, Source, SourceResponse, crate::schema::sources::dsl::name.asc());
+get_all_handler!(
+    get_categories,
+    Category,
+    CategoryResponse,
+    crate::schema::categories::dsl::name.asc()
+);
+get_all_handler!(
+    get_entries,
+    Entry,
+    EntryResponse,
+    (
+        crate::schema::entries::dsl::date.asc(),
+        crate::schema::entries::dsl::created_at.asc(),
+        crate::schema::entries::dsl::id.asc()
+    )
+);
 
 pub async fn unimplemented(
     _app_state: web::Data<AppState>,
@@ -374,7 +462,8 @@ macro_rules! get_by_name_handler {
             let fetched = match $ent::belonging_to(&user)
                 .filter(name.eq(&path_name))
                 .select($ent::as_select())
-                .first(&mut app_state.cpool())
+                .first(&mut app_state.cpool().await)
+                .await
             {
                 Ok(f) => f,
                 Err(e) => {
@@ -389,7 +478,7 @@ macro_rules! get_by_name_handler {
                     }
                 }
             };
-            let response = $resp::stateful_try_from(fetched, &user, app_state.clone());
+            let response = $resp::stateful_try_from(fetched, &user, app_state.clone()).await;
             match response {
                 Err(e) => HttpResponse::from(e),
                 Ok(entity) => HttpResponse::Ok().json(entity),
@@ -420,10 +509,7 @@ pub enum UpdateEntrySourcesError {
         error: diesel::result::Error,
     },
     #[error("Entry {entry_id} is malformed, with source {source_id:?}")]
-    MalformedEntry {
-        entry_id: i32,
-        source_id: Option<i32>,
-    },
+    MalformedEntry { entry_id: i32, source_id: Option<i32> },
     #[error("Failed to update source {source_id:?} for entry {entry_id}")]
     UpdateError {
         entry_id: i32,
@@ -441,9 +527,13 @@ pub enum UpdateEntrySourcesType {
     Delete,
 }
 
+/// app_state here is for read-only queries
+/// conn, be it a connection or a transcaction, is for updates
+#[allow(clippy::single_match)]
 async fn update_entry_sources(
     entry: &Entry,
     app_state: Arc<AppState>,
+    mut conn: &mut Conn,
     update_type: UpdateEntrySourcesType,
 ) -> Result<i32, UpdateEntrySourcesError> {
     let c1 = match update_type {
@@ -453,60 +543,65 @@ async fn update_entry_sources(
     let c2 = match entry.entry_type {
         EntryType::Borrow => 1f64, // borrowing increases the source
         EntryType::Lend => -1f64,
-        EntryType::Income => -1f64,
-        EntryType::Spend => 1f64,
+        EntryType::Income => 1f64, // income increases the source
+        EntryType::Spend => -1f64,
         EntryType::Convert => -1f64, // convert decreases primary source
     };
-    let source = match Source::get_by_id(entry.source_id, app_state.clone()) {
+    let source = match Source::get_by_id(entry.source_id, app_state.clone()).await {
         Err(e) => {
             return Err(UpdateEntrySourcesError::NoSource {
                 entry_id: entry.id,
                 source_id: Some(entry.source_id),
                 error: e,
-            })
+            });
         }
         Ok(s) => s,
     };
-    let secondary_source = match Source::get_by_id(entry.secondary_source_id, app_state.clone()) {
-        Err(e) => {
-            return Err(UpdateEntrySourcesError::NoSource {
-                entry_id: entry.id,
-                source_id: entry.secondary_source_id,
-                error: e,
-            })
-        }
-        Ok(s) => s,
-    };
+    let secondary_source =
+        match Source::get_by_id(entry.secondary_source_id, app_state.clone()).await {
+            Err(e) => {
+                return Err(UpdateEntrySourcesError::NoSource {
+                    entry_id: entry.id,
+                    source_id: entry.secondary_source_id,
+                    error: e,
+                });
+            }
+            Ok(s) => s,
+        };
     if entry.entry_type != EntryType::Convert && secondary_source.is_some() {
         return Err(UpdateEntrySourcesError::MalformedEntry {
             entry_id: entry.id,
-            source_id: entry.secondary_source_id
+            source_id: entry.secondary_source_id,
         });
     }
     use crate::schema::sources::dsl::*;
 
     match diesel::update(&source)
         .set(amount.eq(source.amount + c1 * c2 * entry.source_amount))
-        .execute(&mut app_state.cpool()) {
-        Err(e) => return Err(UpdateEntrySourcesError::UpdateError {
-            entry_id: entry.id,
-            source_id: Some(entry.source_id),
-            error: e,
-        }),
-        Ok(_) => {},
+        .execute(&mut conn)
+        .await
+    {
+        Err(e) => {
+            return Err(UpdateEntrySourcesError::UpdateError {
+                entry_id: entry.id,
+                source_id: Some(entry.source_id),
+                error: e,
+            });
+        }
+        Ok(_) => {}
     };
     if let Some(a) = entry.secondary_source_amount
         && let Some(ss) = secondary_source
     {
-        match diesel::update(&ss)
-            .set(amount.eq(ss.amount + c1 * a))
-            .execute(&mut app_state.cpool()) {
-            Err(e) => return Err(UpdateEntrySourcesError::UpdateError {
-                entry_id: entry.id,
-                source_id: entry.secondary_source_id,
-                error: e,
-            }),
-            Ok(_) => {},
+        match diesel::update(&ss).set(amount.eq(ss.amount + c1 * a)).execute(&mut conn).await {
+            Err(e) => {
+                return Err(UpdateEntrySourcesError::UpdateError {
+                    entry_id: entry.id,
+                    source_id: entry.secondary_source_id,
+                    error: e,
+                });
+            }
+            Ok(_) => {}
         };
     }
 
@@ -528,24 +623,34 @@ pub async fn delete_entries(
     let fetched = match Entry::belonging_to(&user)
         .select(Entry::as_select())
         .filter(id.eq_any(&req.ids))
-        .load(&mut app_state.cpool())
+        .load(&mut app_state.cpool().await)
+        .await
     {
         Err(e) => {
             return internal(
                 e,
                 format!("E016: Failed to get {} for deletion", Entry::specifier_plural()).as_str(),
-            )
+            );
         }
         Ok(f) => f,
     };
 
-    let futures = fetched
-        .iter()
-        .map(|e| update_entry_sources(e, app_state.clone(), UpdateEntrySourcesType::Delete));
+    // TODO(1): Check that the cpool we use here is the correct value of conn, and not some
+    // transaction we need to make here
+    let futures = fetched.iter().map(async |e| {
+        update_entry_sources(
+            e,
+            app_state.clone(),
+            &mut app_state.cpool().await,
+            UpdateEntrySourcesType::Delete,
+        )
+        .await
+    });
     let source_map_result = join_all(futures).await;
     let (oks, errs): (Vec<_>, Vec<_>) = source_map_result.into_iter().partition_result();
     let deleted_count = diesel::delete(Entry::belonging_to(&user).filter(id.eq_any(oks)))
-        .execute(&mut app_state.cpool());
+        .execute(&mut app_state.cpool().await)
+        .await;
 
     let errs_json = match serde_json::to_string(&errs) {
         Err(e) => {
@@ -592,7 +697,8 @@ pub async fn archive_entries(
     let updated_count =
         diesel::update(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&req.ids)))
             .set(archived.eq(true))
-            .execute(&mut app_state.cpool());
+            .execute(&mut app_state.cpool().await)
+            .await;
     match updated_count {
         Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
         Err(e) => internal(e, "E005: Failed to archive entities"),
@@ -612,13 +718,15 @@ macro_rules! update_handler {
             let app_state = app_state.into_inner();
             let path_name = path_name.into_inner();
             let data = data.into_inner();
-            let change_set = match $changeset::stateful_try_from(data, &user, app_state.clone()) {
-                Err(e) => return HttpResponse::from(e),
-                Ok(c) => c,
-            };
+            let change_set =
+                match $changeset::stateful_try_from(data, &user, app_state.clone()).await {
+                    Err(e) => return HttpResponse::from(e),
+                    Ok(c) => c,
+                };
             match diesel::update($ent::belonging_to(&user).filter(name.eq(&path_name)))
                 .set(change_set)
-                .execute(&mut app_state.cpool())
+                .execute(&mut app_state.cpool().await)
+                .await
             {
                 Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
                 Ok(0) => HttpResponse::NotFound().finish(),
@@ -626,9 +734,7 @@ macro_rules! update_handler {
                     "No underlying error",
                     format!("E010: Updated more than one {}", $ent::specifier()),
                 ),
-                Err(e) => {
-                    return internal(e, format!("E011: Could not update {}", $ent::specifier()))
-                }
+                Err(e) => internal(e, format!("E011: Could not update {}", $ent::specifier())),
             }
         }
     };
@@ -637,6 +743,36 @@ macro_rules! update_handler {
 update_handler!(update_currency, currencies, Currency, UpdateCurrency, UpdateCurrencyRequest);
 update_handler!(update_source, sources, Source, UpdateSource, UpdateSourceRequest);
 update_handler!(update_category, categories, Category, UpdateCategory, UpdateCategoryRequest);
+
+pub async fn update_entry(
+    path_id: web::Path<i32>,
+    app_state: web::Data<AppState>,
+    data: web::Json<UpdateEntryRequest>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use crate::schema::entries::dsl::*;
+    let user = user.into_inner();
+    let app_state = app_state.into_inner();
+    let path_id = path_id.into_inner();
+    let data = data.into_inner();
+    let change_set = match UpdateEntry::stateful_try_from(data, &user, app_state.clone()).await {
+        Err(e) => return HttpResponse::from(e),
+        Ok(c) => c,
+    };
+    match diesel::update(Entry::belonging_to(&user).filter(id.eq(path_id)))
+        .set(change_set)
+        .execute(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
+        Ok(0) => HttpResponse::NotFound().finish(),
+        Ok(2..) => internal(
+            "No underlying error",
+            format!("E010: Updated more than one {}", Entry::specifier()),
+        ),
+        Err(e) => internal(e, format!("E011: Could not update {}", Entry::specifier())),
+    }
+}
 
 /// To un-archive, we update with `{ "archived": false }`
 macro_rules! archive_handler {
@@ -652,21 +788,26 @@ macro_rules! archive_handler {
             let path_name = path_name.into_inner();
             let fetched = match $ent::belonging_to(&user)
                 .filter(name.eq(&path_name))
-                .first::<$ent>(&mut app_state.cpool())
+                .first::<$ent>(&mut app_state.cpool().await)
+                .await
             {
                 Ok(f) => f,
                 Err(_) => {
                     return HttpResponse::NotFound().body(format!("{} not found", $ent::specifier()))
                 }
             };
-            let net_amount = match fetched.get_net_amount(app_state.clone()) {
+            let net_amount = match fetched.get_net_amount(app_state.clone()).await {
                 Ok(t) => t,
                 Err(e) => return internal(e, "E006: Unable to construct sum - failed to archive"),
             };
             if (net_amount - 0f64).abs() > consts::EPSILON {
                 return HttpResponse::BadRequest().body($err);
             }
-            match diesel::update(&fetched).set(archived.eq(true)).execute(&mut app_state.cpool()) {
+            match diesel::update(&fetched)
+                .set(archived.eq(true))
+                .execute(&mut app_state.cpool().await)
+                .await
+            {
                 Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
                 Ok(0) => HttpResponse::NotFound().finish(),
                 Ok(2..) => internal(
@@ -714,7 +855,7 @@ pub async fn find_entries(
     let user = user.into_inner();
     let app_state = app_state.into_inner();
 
-    match Entry::find_by_filter(&query_params, &user, app_state.clone()) {
+    match Entry::find_by_filter(&query_params, &user, app_state.clone()).await {
         Ok(entries) => {
             let sum_amounts: f64 = entries.iter().map(|entry| entry.amount).sum();
 
@@ -723,8 +864,9 @@ pub async fn find_entries(
                 let month_year = entry.date.format("%Y-%m").to_string();
                 *sum_per_month.entry(month_year).or_insert(0.0) += entry.amount;
             }
-            let num_months = sum_per_month.len() as f64;
-            let monthly_average = sum_amounts / num_months;
+            let num_months = sum_per_month.len();
+            let monthly_average =
+                if num_months != 0 { sum_amounts / (num_months as f64) } else { 0.0f64 };
 
             let mut sum_per_category_per_month: HashMap<String, f64> = HashMap::new();
             for entry in &entries {
@@ -739,14 +881,16 @@ pub async fn find_entries(
                 sum_per_month,
                 monthly_average,
                 sum_per_category_per_month,
-                entries: entries
-                    .into_iter()
-                    .map(|o| EntryResponse::stateful_try_from(o, &user, app_state.clone()))
-                    .filter_map(|o| o.ok())
-                    .collect(),
+                entries: join_all(entries.into_iter().map(async |o| {
+                    EntryResponse::stateful_try_from(o, &user, app_state.clone()).await
+                }))
+                .await
+                .into_iter()
+                .filter_map(|o| o.ok())
+                .collect(),
             })
         }
-        Err(e) => internal(e, "E007: Error finding entries"),
+        Err(e) => e.into(),
     }
 }
 
