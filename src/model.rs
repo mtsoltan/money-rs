@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use diesel::{
     Associations, BelongingToDsl, BoolExpressionMethods, ExpressionMethods, Identifiable,
-    Insertable, PgTextExpressionMethods, QueryDsl, Queryable, Selectable, debug_query,
+    Insertable, PgTextExpressionMethods, QueryDsl, Queryable, Selectable,
 };
 use futures::future::join_all;
 use log::warn;
@@ -889,6 +889,7 @@ impl Entry {
         app_state: Arc<AppState>,
     ) -> Result<Vec<Entry>, StatefulTryFromError> {
         use crate::schema::entries::dsl::*;
+        // Boxing the query allows us to mutate it without changing its type.
         let mut query = entries.into_boxed();
 
         let amount_specified =
@@ -1017,7 +1018,7 @@ impl Entry {
             }
         }
 
-        dbg!(debug_query(&query));
+        // dbg!(diesel::debug_query(&query));
         let r_entries = query.load::<Entry>(&mut app_state.cpool().await).await?;
 
         Ok(r_entries)

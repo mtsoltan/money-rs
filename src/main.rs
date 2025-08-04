@@ -73,7 +73,7 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
-                        // TODO(15): ENDPOINT: unimplemented - should be paginated
+                        // TODO(15): ENDPOINT: unimplemented - should be paginatable
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -85,7 +85,7 @@ fn app(
                         .route("/{name}/archive", web::get().to(handlers::archive_source))
                         // TODO(15): ENDPOINT: Entries that have this as source 1 or source 2
                         //  (?primary_only should be possible in request)
-                        //  should be paginated
+                        //  should be paginatable
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -98,7 +98,7 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_category_by_name))
                         .route("/{name}", web::post().to(handlers::update_category))
                         .route("/{name}/archive", web::get().to(handlers::archive_category))
-                        // TODO(15): ENDPOINT: unimplemented - should be paginated
+                        // TODO(15): ENDPOINT: unimplemented - should be paginatable
                         .route("/{name}/entries", web::get().to(handlers::unimplemented)),
                 )
                 .service(
@@ -130,6 +130,8 @@ fn app(
     app
 }
 
+// Tests can run in parallel, do not duplicate source, currency, or category names.
+// Always append some prefix (e.g. `T1`, `T2`, etc.) before their names in different tests.
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
@@ -148,6 +150,7 @@ mod tests {
     use tokio::sync::OnceCell;
 
     use super::*;
+    use crate::env_vars::page_size;
     use crate::handlers::{EmptyResponse, FindEntriesResponse, LoginResponse};
     use crate::model::{
         CategoryResponse, CurrencyResponse, EntryQuery, EntryResponse, SourceResponse,
@@ -313,14 +316,14 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn register_login() { let _ = token().await; }
+    async fn test_register_login() { let _ = token().await; }
 
     #[actix_web::test]
     async fn test_currency_lifecycle() {
         // Cleanup
         {
             use crate::schema::currencies::dsl::*;
-            delete_direct(&pool(), currencies.filter(name.eq("EUR"))).await;
+            delete_direct(&pool(), currencies.filter(name.eq("T1EUR"))).await;
         }
 
         // Get token
@@ -333,37 +336,37 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 1.01})),
+            Some(json!({"name": "T1EUR", "rate_to_fixed": 1.01})),
         )
         .await;
         assert_response_status_is_success(&res);
 
         // Get currency
         let res: TestResponse<CurrencyResponse> =
-            run_req(&app, Method::GET, "/api/currency/EUR", t, None).await;
+            run_req(&app, Method::GET, "/api/currency/T1EUR", t, None).await;
         assert_response_status_is_success(&res);
         let name = res.body.expect("expected body to be set on 200").name;
-        assert_eq!(name, "EUR", "currency name {name} should be EUR");
+        assert_eq!(name, "T1EUR", "currency name {name} should be T1EUR");
 
         // Update currency
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
-            "/api/currency/EUR",
+            "/api/currency/T1EUR",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 1.06})),
+            Some(json!({"name": "T1EUR", "rate_to_fixed": 1.06})),
         )
         .await;
         assert_response_status_is_success(&res);
 
         // Archive currency that has no sources or entries
         let res: TestResponse<EmptyResponse> =
-            run_req(&app, Method::GET, "/api/currency/EUR/archive", t, None).await;
+            run_req(&app, Method::GET, "/api/currency/T1EUR/archive", t, None).await;
         assert_response_status_is_success(&res);
 
         // Confirm update and archive currency
         let res: TestResponse<CurrencyResponse> =
-            run_req(&app, Method::GET, "/api/currency/EUR", t, None).await;
+            run_req(&app, Method::GET, "/api/currency/T1EUR", t, None).await;
         assert_response_status_is_success(&res);
         let body = res.body.expect("expected body to be set on 200");
         assert!(
@@ -379,7 +382,7 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "EUR", "rate_to_fixed": 0.9})),
+            Some(json!({"name": "T1EUR", "rate_to_fixed": 0.9})),
         )
         .await;
         assert_response_status(&res, StatusCode::BAD_REQUEST);
@@ -390,11 +393,11 @@ mod tests {
         // Cleanup
         {
             use crate::schema::sources::dsl::*;
-            delete_direct(&pool(), sources.filter(name.eq("SavingsAccount"))).await;
+            delete_direct(&pool(), sources.filter(name.eq("T2SavingsAccount"))).await;
         }
         {
             use crate::schema::currencies::dsl::*;
-            delete_direct(&pool(), currencies.filter(name.eq("GBP"))).await;
+            delete_direct(&pool(), currencies.filter(name.eq("T2GBP"))).await;
         }
 
         // Get token
@@ -407,7 +410,7 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "GBP", "rate_to_fixed": 1.28})),
+            Some(json!({"name": "T2GBP", "rate_to_fixed": 1.28})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -418,53 +421,53 @@ mod tests {
             Method::POST,
             "/api/source",
             t,
-            Some(json!({"name": "SavingsAccount", "currency": "GBP"})),
+            Some(json!({"name": "T2SavingsAccount", "currency": "T2GBP"})),
         )
         .await;
         assert_response_status_is_success(&res);
 
         // Get a source
         let res: TestResponse<SourceResponse> =
-            run_req(&app, Method::GET, "/api/source/SavingsAccount", t, None).await;
+            run_req(&app, Method::GET, "/api/source/T2SavingsAccount", t, None).await;
         assert_response_status_is_success(&res);
         let name = res.body.expect("expected body to be set on 200").name;
-        assert_eq!(name, "SavingsAccount", "source name should be 'SavingsAccount'");
+        assert_eq!(name, "T2SavingsAccount", "source name should be 'T2SavingsAccount'");
 
         // Update a source
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
-            "/api/source/SavingsAccount",
+            "/api/source/T2SavingsAccount",
             t,
-            Some(json!({"name": "SavingsAccount", "amount": 5000})),
+            Some(json!({"name": "T2SavingsAccount", "amount": 5000})),
         )
         .await;
         assert_response_status_is_success(&res);
 
         // Archive source fails because there is amount
         let res: TestResponse<EmptyResponse> =
-            run_req(&app, Method::GET, "/api/source/SavingsAccount/archive", t, None).await;
+            run_req(&app, Method::GET, "/api/source/T2SavingsAccount/archive", t, None).await;
         assert_response_status(&res, StatusCode::BAD_REQUEST);
 
         // Update source to have no amount
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
-            "/api/source/SavingsAccount",
+            "/api/source/T2SavingsAccount",
             t,
-            Some(json!({"name": "SavingsAccount", "amount": 0})),
+            Some(json!({"name": "T2SavingsAccount", "amount": 0})),
         )
         .await;
         assert_response_status_is_success(&res);
 
         // Archive source
         let res: TestResponse<EmptyResponse> =
-            run_req(&app, Method::GET, "/api/source/SavingsAccount/archive", t, None).await;
+            run_req(&app, Method::GET, "/api/source/T2SavingsAccount/archive", t, None).await;
         assert_response_status_is_success(&res);
 
         // Confirm update and archive of a source
         let res: TestResponse<SourceResponse> =
-            run_req(&app, Method::GET, "/api/source/SavingsAccount", t, None).await;
+            run_req(&app, Method::GET, "/api/source/T2SavingsAccount", t, None).await;
         assert_response_status_is_success(&res);
         let body = res.body.expect("expected body to be set on 200");
         assert!(
@@ -480,8 +483,8 @@ mod tests {
         // Cleanup
         {
             use crate::schema::categories::dsl::*;
-            delete_direct(&pool(), categories.filter(name.eq("RentAndBillsT"))).await;
-            delete_direct(&pool(), categories.filter(name.eq("RecurringExpensesT"))).await;
+            delete_direct(&pool(), categories.filter(name.eq("T3RentAndBills"))).await;
+            delete_direct(&pool(), categories.filter(name.eq("T3RecurringExpenses"))).await;
         }
 
         // Get token
@@ -489,40 +492,48 @@ mod tests {
         let app = at::init_service(app(pool())).await;
 
         // Create category
-        let res: TestResponse<EmptyResponse> =
-            run_req(&app, Method::POST, "/api/category", t, Some(json!({"name": "RentAndBillsT"})))
-                .await;
+        let res: TestResponse<EmptyResponse> = run_req(
+            &app,
+            Method::POST,
+            "/api/category",
+            t,
+            Some(json!({"name": "T3RentAndBills"})),
+        )
+        .await;
         assert_response_status_is_success(&res);
 
         // Get category
         let res: TestResponse<CategoryResponse> =
-            run_req(&app, Method::GET, "/api/category/RentAndBillsT", t, None).await;
+            run_req(&app, Method::GET, "/api/category/T3RentAndBills", t, None).await;
         assert_response_status_is_success(&res);
         let name = res.body.expect("expected body to be set on 200").name;
-        assert_eq!(name, "RentAndBillsT", "category name should be 'RentAndBillsT'");
+        assert_eq!(name, "T3RentAndBills", "category name should be 'T3RentAndBills'");
 
         // Update category name
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
-            "/api/category/RentAndBillsT",
+            "/api/category/T3RentAndBills",
             t,
-            Some(json!({"name": "RecurringExpensesT"})),
+            Some(json!({"name": "T3RecurringExpenses"})),
         )
         .await;
         assert_response_status_is_success(&res);
 
         // Archive category
         let res: TestResponse<EmptyResponse> =
-            run_req(&app, Method::GET, "/api/category/RecurringExpensesT/archive", t, None).await;
+            run_req(&app, Method::GET, "/api/category/T3RecurringExpenses/archive", t, None).await;
         assert_response_status_is_success(&res);
 
         // Confirm update and archive of category by fetching with new name
         let res: TestResponse<CategoryResponse> =
-            run_req(&app, Method::GET, "/api/category/RecurringExpensesT", t, None).await;
+            run_req(&app, Method::GET, "/api/category/T3RecurringExpenses", t, None).await;
         assert_response_status_is_success(&res);
         let body = res.body.expect("expected body to be set on 200");
-        assert_eq!(body.name, "RecurringExpensesT", "category name should be 'RecurringExpensesT'");
+        assert_eq!(
+            body.name, "T3RecurringExpenses",
+            "category name should be 'T3RecurringExpenses'"
+        );
         assert!(body.archived, "category should be archived");
     }
 
@@ -530,19 +541,13 @@ mod tests {
     async fn test_entries_lifecycle() {
         // 0. Cleanup: Delete currencies, categories, sources, and entries if they already exist
         {
-            use crate::schema::entries::dsl::*;
-            delete_direct(&pool(), entries).await;
-        }
-        {
             use crate::schema::categories::dsl::*;
-            delete_direct(&pool(), categories).await;
-        }
-        {
-            use crate::schema::sources::dsl::*;
-            delete_direct(&pool(), sources).await;
-        }
-        {
             use crate::schema::currencies::dsl::*;
+            use crate::schema::entries::dsl::*;
+            use crate::schema::sources::dsl::*;
+            delete_direct(&pool(), entries).await;
+            delete_direct(&pool(), categories).await;
+            delete_direct(&pool(), sources).await;
             delete_direct(&pool(), currencies).await;
         }
 
@@ -595,6 +600,7 @@ mod tests {
             assert_response_status_is_success(&res);
         }
 
+        // Converts without a second source should throw bad request
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
@@ -612,10 +618,10 @@ mod tests {
             })),
         )
         .await;
-        // Converts without a second source should throw bad request
         assert_response_status(&res, StatusCode::BAD_REQUEST);
         assert!(&res.body_string.contains("Malformed CreateEntryRequest"));
 
+        // Requests with unknown fields should throw bad request
         let res: TestResponse<EmptyResponse> = run_req(
             &app,
             Method::POST,
@@ -635,8 +641,6 @@ mod tests {
             })),
         )
         .await;
-
-        // Requests with unknown fields should throw bad request
         assert_response_status(&res, StatusCode::BAD_REQUEST);
         assert!(&res.body_string.contains("Json deserialize error"));
 
@@ -808,7 +812,19 @@ mod tests {
         assert_eq!(body.len(), 20, "Expected 20 entries after deletion");
         assert_eq!(body.iter().filter(|o| o.archived).count(), 2, "Expected 2 archived entries");
 
-        // 10. Ensure that sources with deleted entries get their amounts returned
+        // 10. Assert pagination works
+        let res: TestResponse<Vec<EntryResponse>> =
+            run_req(&app, Method::GET, "/api/entry/all?page=1", t, None).await;
+        assert_response_status_is_success(&res);
+        let body = res.body.expect("Expected entries in response");
+        assert_eq!(
+            body.len() as u32,
+            page_size(),
+            "Expected {} entries in paginated request",
+            page_size()
+        );
+
+        // 11. Ensure that sources with deleted entries get their amounts returned
         for (source, final_amount) in vec![("USDWallet", 880.0), ("USDBankAccount", 965.0)] {
             let res: TestResponse<SourceResponse> =
                 run_req(&app, Method::GET, format!("/api/source/{source}").as_str(), t, None).await;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ::pbkdf2::Pbkdf2;
 use actix_web::{HttpRequest, HttpResponse, web};
-use diesel::query_dsl::methods::{FilterDsl, OrderDsl, SelectDsl};
+use diesel::query_dsl::methods::{FilterDsl, LimitDsl, OffsetDsl, OrderDsl, SelectDsl};
 use diesel::{BelongingToDsl, ExpressionMethods, SelectableHelper, insert_into};
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consts;
 use crate::consts::Conn;
+use crate::env_vars::page_size;
 use crate::http::{ArrayQuery, internal};
 use crate::model::{EntryType, GetById};
 #[allow(unused_imports)]
@@ -52,6 +53,12 @@ pub struct EmptyResponse {}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountResponse {
     pub count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaginatedRequest {
+    page: Option<u32>,
 }
 
 #[cfg(any(test, feature = "create_user"))]
@@ -380,18 +387,21 @@ pub async fn create_entry(
 macro_rules! get_all_handler {
     ($fn_name:ident, $ent:ident, $resp:ident, $order:expr) => {
         pub async fn $fn_name(
-            _req: HttpRequest,
+            web::Query(req): web::Query<PaginatedRequest>,
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
             let user = user.into_inner();
             let app_state = app_state.into_inner();
-            let fetched = match $ent::belonging_to(&user)
-                .select($ent::as_select())
-                .order($order)
-                .load(&mut app_state.cpool().await)
-                .await
-            {
+
+            // Boxing the query allows us to mutate it without changing its type.
+            let mut query = diesel::QueryDsl::into_boxed(
+                $ent::belonging_to(&user).select($ent::as_select()).order($order),
+            );
+            if let Some(page) = req.page {
+                query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
+            }
+            let fetched = match query.load(&mut app_state.cpool().await).await {
                 Err(e) => {
                     return internal(
                         e,
@@ -610,6 +620,9 @@ async fn update_entry_sources(
 
 /// Deleting returns amounts to their respective sources. Please use archive if you do not wish
 /// your entries to vanish from existence and their amounts be returned.
+///
+/// We do not use transactions between update sources and delete here, we simply update sources
+/// then delete for each entry where the update was successful, ignoring the ones that weren't.
 pub async fn delete_entries(
     ArrayQuery(req): ArrayQuery<BulkRequest>,
     app_state: web::Data<AppState>,
@@ -635,8 +648,6 @@ pub async fn delete_entries(
         Ok(f) => f,
     };
 
-    // TODO(1): Check that the cpool we use here is the correct value of conn, and not some
-    // transaction we need to make here
     let futures = fetched.iter().map(async |e| {
         update_entry_sources(
             e,
@@ -673,8 +684,6 @@ pub async fn delete_entries(
         (Ok(count), 0) => HttpResponse::Ok().json(CountResponse { count }),
         (Ok(count), _) => internal(
             errs,
-            // TODO(25): TEST: Test this specific pattern returning an error by force-db-deleting
-            //  the source.
             format!(
                 "E017: Successfully deleted {} {}, but failed to get {} for {}: {}",
                 count,

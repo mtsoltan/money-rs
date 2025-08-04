@@ -56,3 +56,9 @@ pub fn init_logger() {
             .init();
     });
 }
+
+pub fn page_size() -> u32 {
+    static PAGE_SIZE: OnceLock<String> = OnceLock::new();
+    let page_size_str = PAGE_SIZE.get_or_init(|| var("PAGE_SIZE").expect("PAGE_SIZE must be set"));
+    page_size_str.parse::<u32>().expect("PAGE_SIZE must be parsable into u32")
+}
