@@ -4,8 +4,11 @@ use std::sync::Arc;
 
 use ::pbkdf2::Pbkdf2;
 use actix_web::{HttpRequest, HttpResponse, web};
+use diesel::query_builder::BoxedSelectStatement;
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, OffsetDsl, OrderDsl, SelectDsl};
-use diesel::{BelongingToDsl, ExpressionMethods, SelectableHelper, insert_into};
+use diesel::{
+    BelongingToDsl, BoolExpressionMethods, ExpressionMethods, SelectableHelper, insert_into,
+};
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
 use futures::future::join_all;
@@ -57,8 +60,15 @@ pub struct CountResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PaginatedRequest {
+pub struct SimplePaginatedRequest {
     page: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceEntriesRequest {
+    page: Option<u32>,
+    primary_only: Option<bool>,
 }
 
 #[cfg(any(test, feature = "create_user"))]
@@ -387,7 +397,7 @@ pub async fn create_entry(
 macro_rules! get_all_handler {
     ($fn_name:ident, $ent:ident, $resp:ident, $order:expr) => {
         pub async fn $fn_name(
-            web::Query(req): web::Query<PaginatedRequest>,
+            web::Query(req): web::Query<SimplePaginatedRequest>,
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
@@ -831,9 +841,6 @@ macro_rules! archive_handler {
     };
 }
 
-// TODO(15): ENDPOINT: /currency/{name}/sources - sources with balance in a country because: FE
-//  should send another GET request for sources to display:  The balance exists in the following
-//  sources: <_>
 archive_handler!(
     archive_currency,
     currencies,
@@ -855,6 +862,138 @@ archive_handler!(
     "You cannot archive that category while it has entries. You can transfer all entries to \
      another category and then proceed."
 );
+
+macro_rules! get_entries_for {
+    ($fn_name:ident, $parent_table:ident, $ent:ident, $filter_expr:expr,) => {
+        pub async fn $fn_name(
+            web::Query(req): web::Query<SimplePaginatedRequest>,
+            path_name: web::Path<String>,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            use crate::schema::entries::dsl::archived;
+            let app_state = app_state.into_inner();
+            let user = user.into_inner();
+            let path_name = path_name.into_inner();
+
+            let parent = match $ent::belonging_to(&user)
+                .filter(crate::schema::$parent_table::dsl::name.eq(&path_name))
+                .first::<$ent>(&mut app_state.cpool().await)
+                .await
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    return HttpResponse::NotFound().body(format!(
+                        "{} {} not found",
+                        $ent::specifier(),
+                        path_name
+                    ))
+                }
+            };
+
+            // Boxing the query allows us to mutate it without changing its type.
+            let mut query = diesel::QueryDsl::into_boxed(
+                Entry::belonging_to(&user).filter($filter_expr(parent.id).and(archived.eq(false))),
+            );
+            if let Some(page) = req.page {
+                query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
+            }
+            let found = query.load::<Entry>(&mut app_state.cpool().await).await;
+
+            match found {
+                Ok(entries) => {
+                    let out =
+                        join_all(entries.into_iter().map(|e| {
+                            EntryResponse::stateful_try_from(e, &user, app_state.clone())
+                        }))
+                        .await
+                        .into_iter()
+                        .filter_map(Result::ok)
+                        .collect::<Vec<_>>();
+                    HttpResponse::Ok().json(out)
+                }
+                Err(e) => internal(
+                    e,
+                    format!("E020: Failed to get entries for {} {}", $ent::specifier(), path_name),
+                ),
+            }
+        }
+    };
+}
+
+get_entries_for!(get_currency_entries, currencies, Currency, |input_id| {
+    crate::schema::entries::dsl::currency_id.eq(input_id)
+},);
+
+get_entries_for!(get_category_entries, categories, Category, |input_id| {
+    crate::schema::entries::dsl::category_id.eq(input_id)
+},);
+
+pub async fn get_source_entries(
+    web::Query(req): web::Query<SourceEntriesRequest>,
+    path_name: web::Path<String>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use crate::schema::entries::dsl::archived;
+    let app_state = app_state.into_inner();
+    let user = user.into_inner();
+    let path_name = path_name.into_inner();
+
+    let parent = match Source::belonging_to(&user)
+        .filter(crate::schema::sources::dsl::name.eq(&path_name))
+        .first::<Source>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(p) => p,
+        Err(_) => {
+            return HttpResponse::NotFound().body(format!(
+                "{} {} not found",
+                Source::specifier(),
+                path_name
+            ));
+        }
+    };
+
+    // Boxing the query allows us to mutate it without changing its type.
+    let mut query = diesel::QueryDsl::into_boxed(Entry::belonging_to(&user));
+
+    if let Some(primary_only) = req.primary_only
+        && primary_only
+    {
+        query = query.filter(crate::schema::entries::dsl::source_id.eq(parent.id));
+    } else {
+        query = query.filter(
+            crate::schema::entries::dsl::source_id
+                .eq(parent.id)
+                .or(crate::schema::entries::dsl::secondary_source_id.eq(Some(parent.id))),
+        );
+    }
+    query = query.filter(archived.eq(false));
+    if let Some(page) = req.page {
+        query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
+    }
+    let found = query.load::<Entry>(&mut app_state.cpool().await).await;
+
+    match found {
+        Ok(entries) => {
+            let out = join_all(
+                entries
+                    .into_iter()
+                    .map(|e| EntryResponse::stateful_try_from(e, &user, app_state.clone())),
+            )
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+            HttpResponse::Ok().json(out)
+        }
+        Err(e) => internal(
+            e,
+            format!("E020: Failed to get entries for {} {}", Source::specifier(), path_name),
+        ),
+    }
+}
 
 pub async fn find_entries(
     ArrayQuery(query_params): ArrayQuery<EntryQuery>,

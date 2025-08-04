@@ -66,6 +66,7 @@ fn app(
                 .service(
                     web::scope("/currency")
                         .route("", web::post().to(handlers::create_currency))
+                        // Parameters: page
                         .route("", web::get().to(handlers::get_currencies))
                         // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as
                         //  well as that sum but normalized by conversion rates to fixed at the time
@@ -73,24 +74,28 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
-                        // TODO(15): ENDPOINT: unimplemented - should be paginatable
-                        .route("/{name}/entries", web::get().to(handlers::unimplemented)),
+                        // Parameters: page
+                        .route("/{name}/entries", web::get().to(handlers::get_currency_entries))
+                        // TODO(15): ENDPOINT: unimplemented - sources with balance in a country
+                        //  because: FE should send another GET request for sources to display:
+                        //  The balance exists in the following sources: <_>
+                        .route("/{name}/sources", web::get().to(handlers::unimplemented)),
                 )
                 .service(
                     web::scope("/source")
                         .route("", web::post().to(handlers::create_source))
+                        // Parameters: page
                         .route("", web::get().to(handlers::get_sources))
                         .route("/{name}", web::get().to(handlers::get_source_by_name))
                         .route("/{name}", web::post().to(handlers::update_source))
                         .route("/{name}/archive", web::get().to(handlers::archive_source))
-                        // TODO(15): ENDPOINT: Entries that have this as source 1 or source 2
-                        //  (?primary_only should be possible in request)
-                        //  should be paginatable
-                        .route("/{name}/entries", web::get().to(handlers::unimplemented)),
+                        // Parameters: page, primary_only
+                        .route("/{name}/entries", web::get().to(handlers::get_source_entries)),
                 )
                 .service(
                     web::scope("/category")
                         .route("", web::post().to(handlers::create_category))
+                        // Parameters: page
                         .route("", web::get().to(handlers::get_categories))
                         // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as
                         //  well as that sum but normalized by conversion rates to fixed at the time
@@ -98,13 +103,14 @@ fn app(
                         .route("/{name}", web::get().to(handlers::get_category_by_name))
                         .route("/{name}", web::post().to(handlers::update_category))
                         .route("/{name}/archive", web::get().to(handlers::archive_category))
-                        // TODO(15): ENDPOINT: unimplemented - should be paginatable
-                        .route("/{name}/entries", web::get().to(handlers::unimplemented)),
+                        // Parameters: page
+                        .route("/{name}/entries", web::get().to(handlers::get_category_entries)),
                 )
                 .service(
                     web::scope("/entry")
                         .route("", web::post().to(handlers::create_entry))
                         // Basic get-all handler, does not return any statistics
+                        // Parameters: page
                         .route("/all", web::get().to(handlers::get_entries))
                         // - sort (comma separated list of values that fall in
                         //   amount|source|currency|category|date|created_at|entry_type)
@@ -824,7 +830,23 @@ mod tests {
             page_size()
         );
 
-        // 11. Ensure that sources with deleted entries get their amounts returned
+        // 11. Assert that entries-by-parent endpoints work
+        let res: TestResponse<Vec<EntryResponse>> =
+            run_req(&app, Method::GET, "/api/currency/JPY/entries", t, None).await;
+        assert_response_status_is_success(&res);
+        assert!(res.body.unwrap().iter().all(|e| e.currency == "JPY"));
+
+        let res: TestResponse<Vec<EntryResponse>> =
+            run_req(&app, Method::GET, "/api/source/JPYWallet/entries", t, None).await;
+        assert_response_status_is_success(&res);
+        assert!(res.body.unwrap().iter().all(|e| e.source == "JPYWallet"));
+
+        let res: TestResponse<Vec<EntryResponse>> =
+            run_req(&app, Method::GET, "/api/category/Entertainment/entries", t, None).await;
+        assert_response_status_is_success(&res);
+        assert!(res.body.unwrap().iter().all(|e| e.category == "Entertainment"));
+
+        // 12. Ensure that sources with deleted entries get their amounts returned
         for (source, final_amount) in vec![("USDWallet", 880.0), ("USDBankAccount", 965.0)] {
             let res: TestResponse<SourceResponse> =
                 run_req(&app, Method::GET, format!("/api/source/{source}").as_str(), t, None).await;
