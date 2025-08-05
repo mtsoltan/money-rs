@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
+use fpdec::Decimal;
 use diesel::{
     Associations, BelongingToDsl, BoolExpressionMethods, ExpressionMethods, Identifiable,
     Insertable, PgTextExpressionMethods, QueryDsl, Queryable, Selectable,
@@ -19,6 +20,8 @@ use {
     inner_macros::Entity // The `inner_macros::Entity` derivable macro itself
 };
 use diesel_async::RunQueryDsl as _;
+
+use crate::numeric::{Numeric, fpdec_to_pg};
 
 #[derive(Debug, PartialEq, Clone, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
 #[ExistingTypePath = "EntryT"]
@@ -90,19 +93,25 @@ pub trait GetById<N, T> {
 
 #[async_trait]
 pub trait GetNetAmount {
-    async fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error>;
+    async fn get_net_amount(
+        &self,
+        app_state: Arc<AppState>,
+    ) -> Result<Decimal, diesel::result::Error>;
 }
 
 #[async_trait]
 impl GetNetAmount for Currency {
-    async fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
+    async fn get_net_amount(
+        &self,
+        app_state: Arc<AppState>,
+    ) -> Result<Decimal, diesel::result::Error> {
         use crate::schema::sources::dsl::*;
-        let entry_amount_sum: f64 = Source::belonging_to(&self)
+        let entry_amount_sum = Source::belonging_to(&self)
             .filter(archived.eq(false))
             .select(amount)
-            .load(&mut app_state.cpool().await)
+            .load::<Numeric>(&mut app_state.cpool().await)
             .await?
-            .iter()
+            .into_iter()
             .sum();
         Ok(entry_amount_sum)
     }
@@ -113,24 +122,27 @@ impl GetNetAmount for Source {
     async fn get_net_amount(
         &self,
         _app_state: Arc<AppState>,
-    ) -> Result<f64, diesel::result::Error> {
-        Ok(self.amount)
+    ) -> Result<Decimal, diesel::result::Error> {
+        Ok((&self.amount).into())
     }
 }
 
 #[async_trait]
 impl GetNetAmount for Category {
-    async fn get_net_amount(&self, app_state: Arc<AppState>) -> Result<f64, diesel::result::Error> {
+    async fn get_net_amount(
+        &self,
+        app_state: Arc<AppState>,
+    ) -> Result<Decimal, diesel::result::Error> {
         use diesel::dsl::sum;
 
         use crate::schema::entries::dsl::*;
-        let entry_amount_sum: f64 = Entry::belonging_to(&self)
+        let entry_amount_sum = Entry::belonging_to(&self)
             .filter(archived.eq(false))
             .select(sum(amount))
-            .load::<Option<f64>>(&mut app_state.cpool().await)
+            .load::<Option<Numeric>>(&mut app_state.cpool().await)
             .await?
-            .iter()
-            .map(|x| x.unwrap_or(0.0f64))
+            .into_iter()
+            .map(|x| x.unwrap_or(Numeric::default()))
             .sum();
         Ok(entry_amount_sum)
     }
@@ -361,7 +373,7 @@ pub struct Currency {
     pub name: String,
     /// This is the amount of fixed currency that fits within 1 this currency that fits within.
     /// For example, the JPY rate_to_fixed would be 0.00667 if the USD is fixed.
-    pub rate_to_fixed: f64,
+    pub rate_to_fixed: Numeric,
     #[entity(HasDefault, NotInCreateRequest)]
     pub archived: bool,
 }
@@ -376,7 +388,7 @@ impl StatefulTryFrom<CreateCurrencyRequest> for NewCurrency {
         Ok(Self {
             user_id: user.id,
             name: value.name,
-            rate_to_fixed: value.rate_to_fixed,
+            rate_to_fixed: value.rate_to_fixed.into(),
             archived: None,
         })
     }
@@ -389,7 +401,7 @@ impl StatefulTryFrom<UpdateCurrencyRequest> for UpdateCurrency {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self { name: value.name, rate_to_fixed: value.rate_to_fixed, archived: value.archived })
+        Ok(Self { name: value.name, rate_to_fixed: value.rate_to_fixed.map(Numeric::from), archived: value.archived })
     }
 }
 
@@ -400,7 +412,7 @@ impl StatefulTryFrom<Currency> for CurrencyResponse {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self { name: value.name, rate_to_fixed: value.rate_to_fixed, archived: value.archived })
+        Ok(Self { name: value.name, rate_to_fixed: value.rate_to_fixed.into(), archived: value.archived })
     }
 }
 
@@ -421,7 +433,7 @@ pub struct Source {
     #[entity(RepresentableAsString, NotInDatabaseUpdate, NotInUpdateRequest)]
     pub currency_id: i32,
     #[entity(HasDefault)]
-    pub amount: f64,
+    pub amount: Numeric,
     #[entity(HasDefault)]
     pub archived: bool,
 }
@@ -469,7 +481,7 @@ impl StatefulTryFrom<Source> for SourceResponse {
         Ok(Self {
             name: value.name,
             currency: Currency::get_name_by_id(value.currency_id, app_state.clone()).await?,
-            amount: value.amount,
+            amount: value.amount.into(),
             archived: value.archived,
         })
     }
@@ -568,10 +580,10 @@ pub struct Entry {
     /// simply delete the entry and recreate it. This is to prevent confusion related to source
     /// value changes due to possible entry currency / amount changes in update.
     #[entity(NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub amount: f64,
+    pub amount: Numeric,
     /// The amount input by the user, converted to the fixed currency.
     #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub amount_in_fixed: f64,
+    pub amount_in_fixed: Numeric,
     /// If `currency_id` is provided, we use it to denominate the amount of the entry.
     ///
     /// If `currency_id` is not provided for entries of any type, the `currency_id` of the source
@@ -586,14 +598,14 @@ pub struct Entry {
     /// Otherwise, uses the calculated default, which is the same exact amount as the specified
     /// `amount`. Like `currency_id`, this is ignored for entries of type `EntryType::Convert`.
     #[entity(HasCalculatedDefault, NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub source_amount: f64,
+    pub source_amount: Numeric,
     /// Only for entry_type of `EntryType::Convert`, as it converts money from one currency to
     /// another, for two provided sources of different currencies. The source `from` is
     /// `source_id`, while the source `to` is `secondary_source_id`.
     #[entity(RepresentableAsString, NotInDatabaseUpdate, NotInUpdateRequest)]
     pub secondary_source_id: Option<i32>,
     #[entity(NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub secondary_source_amount: Option<f64>,
+    pub secondary_source_amount: Option<Numeric>,
     /// Conversion rates for currencies may change, so we store the conversion rate at which this
     /// entry took place inside the entry itself, to keep track of how much it was worth at the
     /// time. This is only present for entries of type `EntryType::Convert` or for those in which
@@ -605,14 +617,14 @@ pub struct Entry {
     /// `currency_id` is not provided, or it is the same as the one from `source_id`, this uses the
     /// default value of `1`, making it always-present.
     #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub conversion_rate: f64,
+    pub conversion_rate: Numeric,
     /// This is fetched from the currency itself for anything but those of type `Entry::Convert`,
     /// in which case it faithfully follows `conversion_rate` if specified, and is fetched from
     /// `rate_to_fixed` of the primary currency if not.
     ///
     /// This is the conversion rate of the amount converted to fixed.
     #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub conversion_rate_to_fixed: f64,
+    pub conversion_rate_to_fixed: Numeric,
     #[entity(RepresentableAsString)]
     pub date: NaiveDateTime,
     #[entity(
@@ -627,8 +639,8 @@ pub struct Entry {
     pub archived: bool,
 }
 
-fn convert_currency(amount: f64, from: &Currency, to: &Currency) -> f64 {
-    from.rate_to_fixed / to.rate_to_fixed * amount
+fn convert_currency<T: Into<Decimal>>(amount: T, from: &Currency, to: &Currency) -> Decimal {
+    from.rate_to_fixed.dec() / to.rate_to_fixed.dec() * amount.into()
 }
 
 #[async_trait]
@@ -674,13 +686,13 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
             // Explicitly provided currency in request.
             // Then, the amount in request is assumed to be of that currency, and converted
             // using the rtf conversion.
-            (None, Some(c)) => convert_currency(value.amount, &c, &primary_source_currency),
+            (None, Some(c)) => convert_currency(value.amount, c, &primary_source_currency),
             // No source amount or currency specified in request.
             // Then, the amount in request is assumed to be of the primary source directly.
             (None, None) => value.amount,
         };
         // 100 * 0.02 = 2 USD (exact to rate)
-        let amount_in_fixed = value.amount * currency.rate_to_fixed;
+        let amount_in_fixed = value.amount * &currency.rate_to_fixed;
         let conversion_rate;
         let conversion_rate_to_fixed;
         let mut secondary_source_id = None;
@@ -728,8 +740,8 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                 // Anything that uses this will not be exact unless either currency or primary is
                 // fixed. Therefore, this should never be used, we should always
                 // rely on source amount.
-                conversion_rate =
-                    primary_source_currency.rate_to_fixed / secondary_source_currency.rate_to_fixed;
+                conversion_rate = &primary_source_currency.rate_to_fixed
+                    / &secondary_source_currency.rate_to_fixed;
                 conversion_rate_to_fixed = secondary_source_currency.rate_to_fixed;
             }
             e => {
@@ -749,8 +761,8 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                     );
                 }
                 // From the specified value currency to the primary source's.
-                conversion_rate = currency.rate_to_fixed / primary_source_currency.rate_to_fixed;
-                conversion_rate_to_fixed = primary_source_currency.rate_to_fixed;
+                conversion_rate = &currency.rate_to_fixed / &primary_source_currency.rate_to_fixed;
+                conversion_rate_to_fixed = primary_source_currency.rate_to_fixed.clone();
             }
         };
 
@@ -765,16 +777,16 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                 app_state.clone(),
             )
             .await?,
-            amount: value.amount,
+            amount: value.amount.into(),
             date: NaiveDate::parse_from_str(value.date.as_str(), "%F")?.into(),
             created_at: None,
             entry_type: value.entry_type,
             currency_id: currency.id,
-            amount_in_fixed,
-            conversion_rate,
+            amount_in_fixed: amount_in_fixed.into(),
+            conversion_rate: conversion_rate.into(),
             conversion_rate_to_fixed,
             source_id: primary_source.id,
-            source_amount,
+            source_amount: source_amount.into(),
             secondary_source_id,
             secondary_source_amount: value.secondary_source_amount,
             archived: None,
@@ -822,19 +834,19 @@ impl StatefulTryFrom<Entry> for EntryResponse {
             long_description: value.long_description,
             target: value.target,
             category: Category::get_name_by_id(value.category_id, app_state.clone()).await?,
-            amount: value.amount,
-            amount_in_fixed: value.amount_in_fixed,
+            amount: value.amount.into(),
+            amount_in_fixed: value.amount_in_fixed.into(),
             date: value.date.format("%F").to_string(),
             created_at: value.created_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
             currency: Currency::get_name_by_id(value.currency_id, app_state.clone()).await?,
             entry_type: value.entry_type,
             source: Source::get_name_by_id(value.source_id, app_state.clone()).await?,
-            source_amount: value.source_amount,
+            source_amount: value.source_amount.into(),
             secondary_source: Source::get_name_by_id(value.secondary_source_id, app_state.clone())
                 .await?,
             secondary_source_amount: value.secondary_source_amount,
-            conversion_rate: value.conversion_rate,
-            conversion_rate_to_fixed: value.conversion_rate_to_fixed,
+            conversion_rate: value.conversion_rate.into(),
+            conversion_rate_to_fixed: value.conversion_rate_to_fixed.into(),
             archived: value.archived,
         })
     }
@@ -866,11 +878,11 @@ pub struct EntryQuery {
     pub categories: Option<Vec<String>>,
     pub currencies: Option<Vec<String>>,
     pub currency: Option<String>,
-    pub amount: Option<f64>,
-    pub min_amount: Option<f64>,
-    pub max_amount: Option<f64>,
-    pub min_amount_in_fixed: Option<f64>,
-    pub max_amount_in_fixed: Option<f64>,
+    pub amount: Option<Decimal>,
+    pub min_amount: Option<Decimal>,
+    pub max_amount: Option<Decimal>,
+    pub min_amount_in_fixed: Option<Decimal>,
+    pub max_amount_in_fixed: Option<Decimal>,
     pub date: Option<String>,
     pub after: Option<String>,
     pub before: Option<String>,
@@ -950,23 +962,23 @@ impl Entry {
         }
 
         if let Some(q_amount) = &query_params.amount {
-            query = query.filter(amount.eq(q_amount));
+            query = query.filter(amount.eq(fpdec_to_pg(q_amount)));
         }
 
         if let Some(min_amount) = query_params.min_amount {
-            query = query.filter(amount.ge(min_amount));
+            query = query.filter(amount.ge(fpdec_to_pg(&min_amount)));
         }
 
         if let Some(max_amount) = query_params.max_amount {
-            query = query.filter(amount.le(max_amount));
+            query = query.filter(amount.le(fpdec_to_pg(&max_amount)));
         }
 
         if let Some(min_amount_in_fixed) = query_params.min_amount_in_fixed {
-            query = query.filter(amount_in_fixed.ge(min_amount_in_fixed));
+            query = query.filter(amount_in_fixed.ge(fpdec_to_pg(&min_amount_in_fixed)));
         }
 
         if let Some(max_amount_in_fixed) = query_params.max_amount_in_fixed {
-            query = query.filter(amount_in_fixed.le(max_amount_in_fixed));
+            query = query.filter(amount_in_fixed.le(fpdec_to_pg(&max_amount_in_fixed)));
         }
 
         if let Some(q_date) = &query_params.date {

@@ -11,6 +11,7 @@ mod env_vars;
 mod handlers;
 mod http;
 mod model;
+mod numeric;
 mod schema;
 
 use actix_web::{App, HttpServer, web};
@@ -43,6 +44,14 @@ fn pool() -> Pool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(env_vars::database_url());
     Pool::builder(manager).build().expect("Failed to create pool")
 }
+
+// TODO(10): Use moneta with fpdec, find a way for fpdec to be the postgres-types numeric
+//  https://docs.rs/postgres-types/latest/postgres_types/
+//  https://docs.rs/fpdec/latest/fpdec/
+//  https://docs.rs/moneta/latest/moneta/type.AmountT.html
+//  https://docs.rs/moneta/latest/moneta/struct.Decimal.html
+//  rust-decimal supports posgres numeric out of the box, but it has 96-bit precision instead of
+// 128-bit  https://docs.rs/rust_decimal/1.37.2/rust_decimal/#db-postgres
 
 fn app(
     pool: Pool,
@@ -150,6 +159,8 @@ mod tests {
     use serde::de::{DeserializeOwned, StdError};
     use serde_json::json;
     use tokio::sync::OnceCell;
+    use fpdec::Dec;
+    use fpdec::Decimal;
 
     use super::*;
     use crate::env_vars::page_size;
@@ -340,7 +351,7 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "T1EUR", "rate_to_fixed": 1.01})),
+            Some(json!({"name": "T1EUR", "rate_to_fixed": "1.01"})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -358,7 +369,7 @@ mod tests {
             Method::POST,
             "/api/currency/T1EUR",
             t,
-            Some(json!({"name": "T1EUR", "rate_to_fixed": 1.06})),
+            Some(json!({"name": "T1EUR", "rate_to_fixed": "1.06"})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -374,7 +385,7 @@ mod tests {
         assert_response_status_is_success(&res);
         let body = res.body.expect("expected body to be set on 200");
         assert!(
-            (body.rate_to_fixed - 1.06).abs() < consts::EPSILON,
+            (body.rate_to_fixed - Dec!(1.06)).abs() < consts::EPSILON,
             "currency rate {} should be 1.06",
             body.rate_to_fixed
         );
@@ -386,7 +397,7 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "T1EUR", "rate_to_fixed": 0.9})),
+            Some(json!({"name": "T1EUR", "rate_to_fixed": "0.9"})),
         )
         .await;
         assert_response_status(&res, StatusCode::BAD_REQUEST);
@@ -414,7 +425,7 @@ mod tests {
             Method::POST,
             "/api/currency",
             t,
-            Some(json!({"name": "T2GBP", "rate_to_fixed": 1.28})),
+            Some(json!({"name": "T2GBP", "rate_to_fixed": "1.28"})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -443,7 +454,7 @@ mod tests {
             Method::POST,
             "/api/source/T2SavingsAccount",
             t,
-            Some(json!({"name": "T2SavingsAccount", "amount": 5000})),
+            Some(json!({"name": "T2SavingsAccount", "amount": "5000"})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -459,7 +470,7 @@ mod tests {
             Method::POST,
             "/api/source/T2SavingsAccount",
             t,
-            Some(json!({"name": "T2SavingsAccount", "amount": 0})),
+            Some(json!({"name": "T2SavingsAccount", "amount": "0"})),
         )
         .await;
         assert_response_status_is_success(&res);
@@ -475,7 +486,7 @@ mod tests {
         assert_response_status_is_success(&res);
         let body = res.body.expect("expected body to be set on 200");
         assert!(
-            (body.amount - 0.0).abs() < consts::EPSILON,
+            body.amount.abs() < consts::EPSILON,
             "source amount {} should be 0.0",
             body.amount
         );
@@ -560,7 +571,7 @@ mod tests {
         let app = at::init_service(app(pool())).await;
 
         // 1. Create Currencies: EGP and JPY
-        let currencies = vec![("EGP", 0.02), ("JPY", 0.00667)];
+        let currencies = vec![("EGP", "0.02"), ("JPY", "0.00667")];
         for &(currency, rtf) in &currencies {
             let res: TestResponse<EmptyResponse> = run_req(
                 &app,
@@ -585,12 +596,12 @@ mod tests {
         // 3. Create Sources for each currency (USD, EGP, JPY)
         // Final amounts before archival and deletion are included.
         let source_data = vec![
-            ("USDBankAccount", "USD", 915.0),
-            ("USDWallet", "USD", 1080.0),
-            ("EGPBankAccount", "EGP", 40250.0),
-            ("EGPWallet", "EGP", 60750.0),
-            ("JPYBankAccount", "JPY", 142079.160419),
-            ("JPYWallet", "JPY", 179410.044977),
+            ("USDBankAccount", "USD", Dec!(915.0)),
+            ("USDWallet", "USD", Dec!(1080.0)),
+            ("EGPBankAccount", "EGP", Dec!(40250.0)),
+            ("EGPWallet", "EGP", Dec!(60750.0)),
+            ("JPYBankAccount", "JPY", Dec!(142079.160419)),
+            ("JPYWallet", "JPY", Dec!(179410.044977)),
         ];
         for &(source, currency, _) in &source_data {
             let res: TestResponse<EmptyResponse> = run_req(
@@ -612,7 +623,7 @@ mod tests {
             t,
             Some(json!({
                 "entry_type": "Convert",
-                "amount": 500.0,
+                "amount": "500.0",
                 "source": "JPYWallet",
                 "target": Some("Relative"),
                 "category": "LivingExpenses",
@@ -656,32 +667,32 @@ mod tests {
         #[rustfmt::skip]
         let entries_data = vec![
             // Start with 1k usd worth of currency in each source, jpy is 149925.037481, egp is 50000
-            ("Income", 1000.0, "USD", "JPYBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
-            ("Income", 1000.0, "USD", "EGPBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-02", Expected::Success),
-            ("Income", 1000.0, "USD", "USDBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-03", Expected::Success),
-            ("Income", 1000.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-04", Expected::Success),
-            ("Income", 1000.0, "USD", "EGPWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-05", Expected::Success),
-            ("Income", 1000.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-06", Expected::Success),
-            ("Borrow",   65.0, "USD", "USDBankAccount", Some("Relative"),       None,                   None,          "Entertainment",     "2023-02-07", Expected::Success), // USDBankAccount 1065 - Gets archived
-            ("Convert", 400.0, "EGP", "USDWallet",      None,                   Some("JPYWallet"),      Some(61877.0), "RecurringExpenses", "2023-03-08", Expected::BadRequest), // The EGP currency in this entry is ambiguous
-            ("Spend",    90.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-04-09", Expected::Success), // JPYBankAccount 136431.784108
-            ("Income",  200.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-10", Expected::Success), // JPYWallet 179910.044977
-            ("Lend",     75.0, "USD", "EGPBankAccount", Some("Associate"),      None,                   None,          "LivingExpenses",    "2023-06-11", Expected::Success), // EGPBankAccount 46250
-            ("Borrow",   85.0, "USD", "EGPWallet",      Some("Partner"),        None,                   None,          "Purchases",         "2023-07-12", Expected::Success), // EGPWallet 54250
-            ("Convert", 500.0, "JPY", "JPYWallet",      None,                   Some("JPYBankAccount"), Some(400.0),   "Entertainment",     "2023-08-13", Expected::Success), // JPYWallet 179410.044977 JPYBankAccount 136831.784108 - This conversion should just lose me money, but it should be valid
-            ("Spend",   100.0, "USD", "USDBankAccount", None,                   None,                   None,          "LivingExpenses",    "2023-01-14", Expected::Success), // USDBankAccount 965 - Gets archived
-            ("Income",  200.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-02-15", Expected::Success), // USDWallet 1200 - Gets deleted
-            ("Lend",     50.0, "USD", "USDBankAccount", Some("John Doe"),       None,                   None,          "Purchases",         "2023-03-16", Expected::Success), // USDBankAccount 915 - Gets deleted
-            ("Borrow",   75.0, "USD", "USDWallet",      Some("Jane Doe"),       None,                   None,          "Entertainment",     "2023-04-17", Expected::Success), // USDWallet 1275
-            ("Convert", 500.0, "USD", "USDBankAccount", None,                   Some("EGPWallet"),      None,          "LivingExpenses",    "2023-05-18", Expected::BadRequest), // Convert without secondary source amount
-            ("Spend",   120.0, "USD", "EGPBankAccount", None,                   None,                   None,          "Purchases",         "2023-06-19", Expected::Success), // EGPBankAccount 40250
-            ("Income",  130.0, "USD", "EGPWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-07-20", Expected::Success), // EGPWallet 60750
-            ("Lend",     80.0, "USD", "JPYBankAccount", Some("Friend"),         None,                   None,          "Entertainment",     "2023-08-21", Expected::Success), // JPYBankAccount 124837.781109
-            ("Borrow",   90.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-09-22", Expected::BadRequest), // Borrow / lend needs target
-            ("Convert", 200.0, "JPY", "JPYWallet",      None,                   Some("EGPBankAccount"), None,          "Purchases",         "2023-10-23", Expected::BadRequest), // Secondary source amount required on convert
-            ("Spend",   110.0, "USD", "USDWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-11-24", Expected::Success), // USDWallet 1165
-            ("Income",  115.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-12-25", Expected::Success), // JPYBankAccount 142079.160419
-            ("Lend",     85.0, "USD", "USDWallet",      Some("Neighbor"),       None,                   None,          "Purchases",         "2024-01-26", Expected::Success), // USDWallet 1080
+            ("Income", "1000.0", "USD", "JPYBankAccount", None,                   None,                   None,            "RecurringExpenses", "2023-05-01", Expected::Success),
+            ("Income", "1000.0", "USD", "EGPBankAccount", None,                   None,                   None,            "RecurringExpenses", "2023-05-02", Expected::Success),
+            ("Income", "1000.0", "USD", "USDBankAccount", None,                   None,                   None,            "RecurringExpenses", "2023-05-03", Expected::Success),
+            ("Income", "1000.0", "USD", "JPYWallet",      None,                   None,                   None,            "RecurringExpenses", "2023-05-04", Expected::Success),
+            ("Income", "1000.0", "USD", "EGPWallet",      None,                   None,                   None,            "RecurringExpenses", "2023-05-05", Expected::Success),
+            ("Income", "1000.0", "USD", "USDWallet",      None,                   None,                   None,            "RecurringExpenses", "2023-05-06", Expected::Success),
+            ("Borrow",   "65.0", "USD", "USDBankAccount", Some("Relative"),       None,                   None,            "Entertainment",     "2023-02-07", Expected::Success), // USDBankAccount 1065 - Gets archived
+            ("Convert", "400.0", "EGP", "USDWallet",      None,                   Some("JPYWallet"),      Some("61877.0"), "RecurringExpenses", "2023-03-08", Expected::BadRequest), // The EGP currency in this entry is ambiguous
+            ("Spend",    "90.0", "USD", "JPYBankAccount", None,                   None,                   None,            "Entertainment",     "2023-04-09", Expected::Success), // JPYBankAccount 136431.784108
+            ("Income",  "200.0", "USD", "JPYWallet",      None,                   None,                   None,            "RecurringExpenses", "2023-05-10", Expected::Success), // JPYWallet 179910.044977
+            ("Lend",     "75.0", "USD", "EGPBankAccount", Some("Associate"),      None,                   None,            "LivingExpenses",    "2023-06-11", Expected::Success), // EGPBankAccount 46250
+            ("Borrow",   "85.0", "USD", "EGPWallet",      Some("Partner"),        None,                   None,            "Purchases",         "2023-07-12", Expected::Success), // EGPWallet 54250
+            ("Convert", "500.0", "JPY", "JPYWallet",      None,                   Some("JPYBankAccount"), Some("400.0"),   "Entertainment",     "2023-08-13", Expected::Success), // JPYWallet 179410.044977 JPYBankAccount 136831.784108 - This conversion should just lose me money, but it should be valid
+            ("Spend",   "100.0", "USD", "USDBankAccount", None,                   None,                   None,            "LivingExpenses",    "2023-01-14", Expected::Success), // USDBankAccount 965 - Gets archived
+            ("Income",  "200.0", "USD", "USDWallet",      None,                   None,                   None,            "RecurringExpenses", "2023-02-15", Expected::Success), // USDWallet 1200 - Gets deleted
+            ("Lend",     "50.0", "USD", "USDBankAccount", Some("John Doe"),       None,                   None,            "Purchases",         "2023-03-16", Expected::Success), // USDBankAccount 915 - Gets deleted
+            ("Borrow",   "75.0", "USD", "USDWallet",      Some("Jane Doe"),       None,                   None,            "Entertainment",     "2023-04-17", Expected::Success), // USDWallet 1275
+            ("Convert", "500.0", "USD", "USDBankAccount", None,                   Some("EGPWallet"),      None,            "LivingExpenses",    "2023-05-18", Expected::BadRequest), // Convert without secondary source amount
+            ("Spend",   "120.0", "USD", "EGPBankAccount", None,                   None,                   None,            "Purchases",         "2023-06-19", Expected::Success), // EGPBankAccount 40250
+            ("Income",  "130.0", "USD", "EGPWallet",      None,                   None,                   None,            "LivingExpenses",    "2023-07-20", Expected::Success), // EGPWallet 60750
+            ("Lend",     "80.0", "USD", "JPYBankAccount", Some("Friend"),         None,                   None,            "Entertainment",     "2023-08-21", Expected::Success), // JPYBankAccount 124837.781109
+            ("Borrow",   "90.0", "USD", "JPYWallet",      None,                   None,                   None,            "RecurringExpenses", "2023-09-22", Expected::BadRequest), // Borrow / lend needs target
+            ("Convert", "200.0", "JPY", "JPYWallet",      None,                   Some("EGPBankAccount"), None,            "Purchases",         "2023-10-23", Expected::BadRequest), // Secondary source amount required on convert
+            ("Spend",   "110.0", "USD", "USDWallet",      None,                   None,                   None,            "LivingExpenses",    "2023-11-24", Expected::Success), // USDWallet 1165
+            ("Income",  "115.0", "USD", "JPYBankAccount", None,                   None,                   None,            "Entertainment",     "2023-12-25", Expected::Success), // JPYBankAccount 142079.160419
+            ("Lend",     "85.0", "USD", "USDWallet",      Some("Neighbor"),       None,                   None,            "Purchases",         "2024-01-26", Expected::Success), // USDWallet 1080
         ];
 
         for (
@@ -732,7 +743,7 @@ mod tests {
             assert_response_status_is_success(&res);
             let amount = res.body.expect("expected body to be set on 200").amount;
             assert!(
-                approx::abs_diff_eq!(amount, final_amount, epsilon = 0.001),
+                (amount - final_amount).abs() < consts::EPSILON,
                 "{source}: expected final_amount to be {final_amount} found {amount}"
             );
         }
@@ -747,13 +758,13 @@ mod tests {
         // 7. Use find entries with different filters and verify results
         #[rustfmt::skip]
         let filters: Vec<(EntryQuery, i32)> = vec![
-            (EntryQuery { amount: Some(90.0), ..Default::default() }, -1),
+            (EntryQuery { amount: Some(Dec!(90.0)), ..Default::default() }, -1),
             // The other 90 is a bad request
-            (EntryQuery { amount: Some(90.0), currency: Some("USD".to_string()), ..Default::default() }, 1),
-            (EntryQuery { min_amount: Some(80.0), currency: Some("USD".to_string()), ..Default::default() }, 17),
+            (EntryQuery { amount: Some(Dec!(90.0)), currency: Some("USD".to_string()), ..Default::default() }, 1),
+            (EntryQuery { min_amount: Some(Dec!(80.0)), currency: Some("USD".to_string()), ..Default::default() }, 17),
             // The following two ensure converts work
-            (EntryQuery { max_amount: Some(120.0), currency: Some("USD".to_string()), ..Default::default() }, 12),
-            (EntryQuery { max_amount_in_fixed: Some(120.0), ..Default::default() }, 13),
+            (EntryQuery { max_amount: Some(Dec!(120.0)), currency: Some("USD".to_string()), ..Default::default() }, 12),
+            (EntryQuery { max_amount_in_fixed: Some(Dec!(120.0)), ..Default::default() }, 13),
             (EntryQuery { currencies: Some(vec!["EGP".to_string()]), ..Default::default() }, 0),
             (EntryQuery { currencies: Some(vec!["JPY".to_string()]), ..Default::default() }, 1),
             (EntryQuery { sources: Some(vec!["JPYBankAccount".to_string()]), ..Default::default()}, 4),
@@ -843,13 +854,13 @@ mod tests {
         assert!(res.body.unwrap().iter().all(|e| e.category == "Entertainment"));
 
         // 12. Ensure that sources with deleted entries get their amounts returned
-        for (source, final_amount) in vec![("USDWallet", 880.0), ("USDBankAccount", 965.0)] {
+        for (source, final_amount) in vec![("USDWallet", Dec!(880.0)), ("USDBankAccount", Dec!(965.0))] {
             let res: TestResponse<SourceResponse> =
                 run_req(&app, Method::GET, format!("/api/source/{source}").as_str(), t, None).await;
             assert_response_status_is_success(&res);
             let amount = res.body.expect("expected body to be set on 200").amount;
             assert!(
-                approx::abs_diff_eq!(amount, final_amount, epsilon = 0.001),
+                (amount - final_amount).abs() < consts::EPSILON,
                 "{source}: expected final_amount to be {final_amount} found {amount}"
             );
         }
@@ -863,24 +874,24 @@ mod tests {
 
         // sum over past 12 months (2024-08 through 2025-07) is 0
         assert!(
-            (stats.year_sum_in_fixed - 313.335).abs() < consts::EPSILON,
+            (stats.year_sum_in_fixed - Dec!(313.335)).abs() < consts::EPSILON,
             "expected year_sum_in_fixed 313.335, got {}",
             stats.year_sum_in_fixed
         );
         // average = sum/12 = 0
         assert!(
-            (stats.monthly_average_in_fixed - 26.11125).abs() < consts::EPSILON,
+            (stats.monthly_average_in_fixed - Dec!(26.11125)).abs() < consts::EPSILON,
             "expected monthly_average_in_fixed 26.11125, got {}",
             stats.monthly_average_in_fixed
         );
         // breakdown must be twelve zeros
         assert_eq!(
             stats.month_breakdown_in_fixed,
-            vec![0.0, 0.0, 65.0, 0.0, 165.0, 0.0, 0.0, 0.0, 83.335, 0.0, 0.0, 0.0,]
+            vec![Dec!(0.0), Dec!(0.0), Dec!(65.0), Dec!(0.0), Dec!(165.0), Dec!(0.0), Dec!(0.0), Dec!(0.0), Dec!(83.335), Dec!(0.0), Dec!(0.0), Dec!(0.0)]
         );
         // current month (2025-08) sum = 0
         assert!(
-            (stats.current_month_in_fixed - 115.0).abs() < consts::EPSILON,
+            (stats.current_month_in_fixed - Dec!(115.0)).abs() < consts::EPSILON,
             "expected current_month_in_fixed 115.0, got {}",
             stats.current_month_in_fixed
         );

@@ -13,7 +13,7 @@ create table currencies (
     id serial primary key,
     user_id int4 not null references users(id) on delete cascade,
     name varchar(63) not null,
-    rate_to_fixed float8 not null,
+    rate_to_fixed numeric(39, 20) not null,
     constraint unq_user_currency unique (user_id, name),
     archived boolean not null default false
 );
@@ -38,7 +38,7 @@ create table sources (
     user_id int4 not null references users(id) on delete cascade,
     name varchar(127) not null,
     currency_id int4 not null references currencies(id) on delete restrict,
-    amount float8 not null default 0,
+    amount numeric(39, 20) not null default 0,
     constraint unq_user_source unique (user_id, name),
     archived boolean not null default false
 );
@@ -53,16 +53,16 @@ create table entries (
     long_description text null,
     target varchar(127),
     category_id int4 not null references categories(id) on delete restrict,
-    amount float8 not null,
-    amount_in_fixed float8 not null,
+    amount numeric(39, 30) not null,
+    amount_in_fixed numeric(39, 20) not null,
     currency_id int4 not null references currencies(id) on delete restrict,
     entry_type entry_t not null,
     source_id int4 not null references sources(id) on delete restrict,
-    source_amount float8 not null,
+    source_amount numeric(39, 20) not null,
     secondary_source_id int4 null references sources(id) on delete restrict,
-    secondary_source_amount float8 null,
-    conversion_rate float8 not null default 1.0,
-    conversion_rate_to_fixed float8 not null,
+    secondary_source_amount numeric(39, 20) null,
+    conversion_rate numeric(39, 20) not null default 1.0,
+    conversion_rate_to_fixed numeric(39, 20) not null,
     date timestamp not null,
     created_at timestamp not null default now(),
     archived boolean not null default false

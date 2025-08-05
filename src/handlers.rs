@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use fpdec::{Dec, Decimal};
 use ::pbkdf2::Pbkdf2;
 use actix_web::{HttpRequest, HttpResponse, web};
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, OffsetDsl, OrderDsl, SelectDsl};
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consts;
 use crate::consts::Conn;
+use crate::numeric::Numeric;
 use crate::env_vars::page_size;
 use crate::http::{ArrayQuery, internal};
 use crate::model::{EntryType, GetById, GetByNameAndUser};
@@ -58,10 +60,10 @@ pub struct CategoryStatsRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CategoryStatsResponse {
-    pub year_sum_in_fixed: f64,
-    pub monthly_average_in_fixed: f64,
-    pub month_breakdown_in_fixed: Vec<f64>,
-    pub current_month_in_fixed: f64,
+    pub year_sum_in_fixed: Decimal,
+    pub monthly_average_in_fixed: Decimal,
+    pub month_breakdown_in_fixed: Vec<Decimal>,
+    pub current_month_in_fixed: Decimal,
     pub year_largest_spends: Vec<EntryResponse>,
 }
 
@@ -113,9 +115,9 @@ pub struct LoginResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FindEntriesResponse {
-    pub sum_per_month: HashMap<String, f64>,
-    pub monthly_average: f64,
-    pub sum_per_category_per_month: HashMap<String, f64>,
+    pub sum_per_month: HashMap<String, Decimal>,
+    pub monthly_average: Decimal,
+    pub sum_per_category_per_month: HashMap<String, Decimal>,
     pub entries: Vec<EntryResponse>,
 }
 
@@ -207,7 +209,7 @@ pub async fn create_user(
                 user_id: user.id,
                 name: std::mem::take(&mut data.currency),
                 // IEEE-754 float64 multiplication by 1 is always exact.
-                rate_to_fixed: 1.0f64,
+                rate_to_fixed: Numeric::from(Dec!(1.0)),
                 archived: None,
             })
             .execute(&mut app_state.cpool().await)
@@ -581,13 +583,13 @@ pub async fn get_category_stats(
             );
         }
     };
-    let year_sum_in_fixed: f64 = found.iter().map(|e| e.amount_in_fixed).sum();
+    let year_sum_in_fixed: Decimal = found.iter().map(|e| &e.amount_in_fixed).sum();
     // Order months from same-month last year to the month before this one
     let chunked_by_month =
         found.iter().chunk_by(|item| (12u32 + item.date.month() - now.month()) % 12);
-    let mut month_breakdown_in_fixed = vec![0.0f64; 12];
+    let mut month_breakdown_in_fixed = vec![Decimal::ZERO; 12];
     chunked_by_month.into_iter().for_each(|(month, g)| {
-        month_breakdown_in_fixed[month as usize] = g.map(|e| e.amount_in_fixed).sum()
+        month_breakdown_in_fixed[month as usize] = g.map(|e| &e.amount_in_fixed).sum()
     });
 
     let found: Vec<Entry> = match entries
@@ -610,7 +612,7 @@ pub async fn get_category_stats(
             );
         }
     };
-    let current_month_in_fixed: f64 = found.iter().map(|e| e.amount_in_fixed).sum();
+    let current_month_in_fixed: Decimal = found.iter().map(|e| &e.amount_in_fixed).sum();
 
     let found: Vec<Entry> = match entries
         .filter(category_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(year_ago))))
@@ -643,7 +645,7 @@ pub async fn get_category_stats(
     .collect();
     let response = CategoryStatsResponse {
         year_sum_in_fixed,
-        monthly_average_in_fixed: year_sum_in_fixed / 12.0f64,
+        monthly_average_in_fixed: year_sum_in_fixed / Dec!(12.0),
         month_breakdown_in_fixed,
         current_month_in_fixed,
         year_largest_spends,
@@ -697,15 +699,15 @@ async fn update_entry_sources(
     update_type: UpdateEntrySourcesType,
 ) -> Result<i32, UpdateEntrySourcesError> {
     let c1 = match update_type {
-        UpdateEntrySourcesType::Create => 1f64,
-        UpdateEntrySourcesType::Delete => -1f64,
+        UpdateEntrySourcesType::Create => Dec!(1),
+        UpdateEntrySourcesType::Delete => Dec!(-1),
     };
     let c2 = match entry.entry_type {
-        EntryType::Borrow => 1f64, // borrowing increases the source
-        EntryType::Lend => -1f64,
-        EntryType::Income => 1f64, // income increases the source
-        EntryType::Spend => -1f64,
-        EntryType::Convert => -1f64, // convert decreases primary source
+        EntryType::Borrow => Dec!(1.0), // borrowing increases the source
+        EntryType::Lend => Dec!(-1),
+        EntryType::Income => Dec!(1), // income increases the source
+        EntryType::Spend => Dec!(-1),
+        EntryType::Convert => Dec!(-1), // convert decreases primary source
     };
     let source = match Source::get_by_id(entry.source_id, app_state.clone()).await {
         Err(e) => {
@@ -737,7 +739,7 @@ async fn update_entry_sources(
     use crate::schema::sources::dsl::*;
 
     match diesel::update(&source)
-        .set(amount.eq(source.amount + c1 * c2 * entry.source_amount))
+        .set(amount.eq(Numeric::from(&source.amount + c1 * c2 * &entry.source_amount)))
         .execute(&mut conn)
         .await
     {
@@ -750,10 +752,10 @@ async fn update_entry_sources(
         }
         Ok(_) => {}
     };
-    if let Some(a) = entry.secondary_source_amount
+    if let Some(a) = &entry.secondary_source_amount
         && let Some(ss) = secondary_source
     {
-        match diesel::update(&ss).set(amount.eq(ss.amount + c1 * a)).execute(&mut conn).await {
+        match diesel::update(&ss).set(amount.eq(Numeric::from(&ss.amount + c1 * a))).execute(&mut conn).await {
             Err(e) => {
                 return Err(UpdateEntrySourcesError::UpdateError {
                     entry_id: entry.id,
@@ -958,7 +960,7 @@ macro_rules! archive_handler {
                 Ok(t) => t,
                 Err(e) => return internal(e, "E006: Unable to construct sum - failed to archive"),
             };
-            if (net_amount - 0f64).abs() > consts::EPSILON {
+            if net_amount.abs() > consts::EPSILON {
                 return HttpResponse::BadRequest().body($err);
             }
             match diesel::update(&fetched)
@@ -1208,24 +1210,24 @@ pub async fn find_entries(
 
     match Entry::find_by_filter(&query_params, &user, app_state.clone()).await {
         Ok(entries) => {
-            let sum_amounts: f64 = entries.iter().map(|entry| entry.amount).sum();
+            let sum_amounts: Decimal = entries.iter().map(|entry| &entry.amount).sum();
 
-            let mut sum_per_month: HashMap<String, f64> = HashMap::new();
+            let mut sum_per_month: HashMap<String, Decimal> = HashMap::new();
             for entry in &entries {
                 let month_year = entry.date.format("%Y-%m").to_string();
-                *sum_per_month.entry(month_year).or_insert(0.0) += entry.amount;
+                *sum_per_month.entry(month_year).or_insert(Decimal::ZERO) += entry.amount.dec();
             }
-            let num_months = sum_per_month.len();
+            let num_months = Decimal::from(sum_per_month.len() as u64);
             let monthly_average =
-                if num_months != 0 { sum_amounts / (num_months as f64) } else { 0.0f64 };
+                if num_months != 0 { sum_amounts / num_months } else { Decimal::ZERO };
 
-            let mut sum_per_category_per_month: HashMap<String, f64> = HashMap::new();
+            let mut sum_per_category_per_month: HashMap<String, Decimal> = HashMap::new();
             for entry in &entries {
                 let month_year = entry.date.format("%Y-%m").to_string();
                 let category_month_key =
                     format!("{}|{}", entry.category_id.clone(), month_year.clone());
-                *sum_per_category_per_month.entry(category_month_key).or_insert(0.0) +=
-                    entry.amount;
+                *sum_per_category_per_month.entry(category_month_key).or_insert(Decimal::ZERO) +=
+                    entry.amount.dec();
             }
 
             HttpResponse::Ok().json(FindEntriesResponse {

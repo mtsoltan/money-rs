@@ -24,6 +24,17 @@ fn make_option(ty: &Type) -> Type {
     }
 }
 
+fn is_numeric_type(ty: &Type) -> bool {
+    if let Type::Path(path) = ty {
+        // Check if the type is an Option
+        for segment in &path.path.segments {
+            return segment.ident.to_string() == "Numeric";
+        }
+    }
+    false
+}
+
+
 /// ### Details
 ///
 /// From a basic database-faithful model, this macro generates structs for create and update DTOs as
@@ -91,7 +102,7 @@ fn make_option(ty: &Type) -> Type {
 ///     pub description: String,
 ///     #[entity(RepresentableAsString)]
 ///     pub category_id: i32,
-///     pub amount: f64,
+///     pub amount: Numeric,
 ///     #[entity(RepresentableAsString)]
 ///     pub date: NaiveDateTime,
 ///     #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, HasDefault)]
@@ -103,8 +114,8 @@ fn make_option(ty: &Type) -> Type {
 ///     pub source_id: i32,
 ///     #[entity(RepresentableAsString)]
 ///     pub secondary_source_id: Option<i32>,
-///     pub conversion_rate: Option<f64>,
-///     pub conversion_rate_to_fixed: f64,
+///     pub conversion_rate: Option<Numeric>,
+///     pub conversion_rate_to_fixed: Numeric,
 ///     #[entity(HasDefault)]
 ///     pub archived: bool,
 /// }
@@ -305,8 +316,19 @@ fn entity_macro_internal(
                     field_type.clone()
                 };
 
+                let response_type = if is_numeric_type(&name_type) {
+                    if is_option_type(&name_type) {
+                        parse_quote! { Option<Decimal> }
+                    } else {
+                        parse_quote! { Decimal }
+                    }
+                } else {
+                    name_type.clone()
+                };
+
+
                 if push_to_response {
-                    response_fields.push(quote! { pub #name_ident: #name_type });
+                    response_fields.push(quote! { pub #name_ident: #response_type });
                 }
 
                 let name_type_opt = make_option(&name_type);
@@ -316,9 +338,27 @@ fn entity_macro_internal(
                     if option_in_new { field_type_opt.clone() } else { field_type.clone() };
 
                 let create_request_type = if option_in_create_request {
-                    name_type_opt.clone()
+                    if is_numeric_type(&name_type) {
+                        parse_quote! { Option<Decimal> }
+                    } else {
+                        name_type_opt.clone()
+                    }
                 } else {
-                    name_type.clone()
+                    if is_numeric_type(&name_type) {
+                        if is_option_type(&name_type) {
+                            parse_quote! { Option<Decimal> }
+                        } else {
+                            parse_quote! { Decimal }
+                        }
+                    } else {
+                        name_type.clone()
+                    }
+                };
+
+                let update_request_type = if is_numeric_type(&name_type) {
+                    parse_quote! { Option<Decimal> }
+                } else {
+                    name_type_opt.clone()
                 };
 
                 entity_fields.push(quote! { pub #ident: #field_type });
@@ -336,7 +376,7 @@ fn entity_macro_internal(
                 }
 
                 if push_to_update_request {
-                    update_request_fields.push(quote! { pub #name_ident: #name_type_opt });
+                    update_request_fields.push(quote! { pub #name_ident: #update_request_type });
                 }
             } else {
                 return Err(Diagnostic::new(
