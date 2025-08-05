@@ -1,4 +1,4 @@
-use std::env::{set_var, var};
+use std::env::var;
 use std::sync::OnceLock;
 
 use env_logger::Env;
@@ -6,9 +6,6 @@ use env_logger::Env;
 #[cfg(not(test))]
 pub fn init() {
     dotenv::from_filename(".env").ok();
-    unsafe {
-        set_var("RUST_LOG", "actix_web=debug");
-    }
     init_logger();
     database_url();
     jwt_secret();
@@ -17,9 +14,6 @@ pub fn init() {
 #[cfg(test)]
 pub fn init() {
     dotenv::from_filename("test.env").ok();
-    unsafe {
-        set_var("RUST_LOG", "actix_web=debug");
-    }
     init_logger();
     database_url();
     jwt_secret();

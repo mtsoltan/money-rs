@@ -71,15 +71,14 @@ fn app(
                         // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as
                         //  well as that sum but normalized by conversion rates to fixed at the time
                         //  of spending
+                        .route("/{name}/stats", web::get().to(handlers::unimplemented))
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
                         // Parameters: page
                         .route("/{name}/entries", web::get().to(handlers::get_currency_entries))
-                        // TODO(15): ENDPOINT: unimplemented - sources with balance in a country
-                        //  because: FE should send another GET request for sources to display:
-                        //  The balance exists in the following sources: <_>
-                        .route("/{name}/sources", web::get().to(handlers::unimplemented)),
+                        // Parameters: page
+                        .route("/{name}/sources", web::get().to(handlers::get_currency_sources)),
                 )
                 .service(
                     web::scope("/source")
@@ -97,9 +96,8 @@ fn app(
                         .route("", web::post().to(handlers::create_category))
                         // Parameters: page
                         .route("", web::get().to(handlers::get_categories))
-                        // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as
-                        //  well as that sum but normalized by conversion rates to fixed at the time
-                        //  of spending
+                        // Parameters: now
+                        .route("/{name}/stats", web::get().to(handlers::get_category_stats))
                         .route("/{name}", web::get().to(handlers::get_category_by_name))
                         .route("/{name}", web::post().to(handlers::update_category))
                         .route("/{name}/archive", web::get().to(handlers::archive_category))
@@ -118,8 +116,6 @@ fn app(
                         // sum-per-category-per-month
                         .route("", web::get().to(handlers::find_entries))
                         // Parameters: ids
-                        // TODO(12): ENDPOINT: unimplemented - Use UpdateEntryRequest, but also
-                        //  update source amounts same as deletion
                         .route("/update", web::post().to(handlers::update_entry))
                         // Parameters: ids
                         .route("", web::delete().to(handlers::delete_entries))
@@ -157,7 +153,9 @@ mod tests {
 
     use super::*;
     use crate::env_vars::page_size;
-    use crate::handlers::{EmptyResponse, FindEntriesResponse, LoginResponse};
+    use crate::handlers::{
+        CategoryStatsResponse, EmptyResponse, FindEntriesResponse, LoginResponse,
+    };
     use crate::model::{
         CategoryResponse, CurrencyResponse, EntryQuery, EntryResponse, SourceResponse,
     };
@@ -659,31 +657,31 @@ mod tests {
         let entries_data = vec![
             // Start with 1k usd worth of currency in each source, jpy is 149925.037481, egp is 50000
             ("Income", 1000.0, "USD", "JPYBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
-            ("Income", 1000.0, "USD", "EGPBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
-            ("Income", 1000.0, "USD", "USDBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
-            ("Income", 1000.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
-            ("Income", 1000.0, "USD", "EGPWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
-            ("Income", 1000.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success),
-            ("Borrow",   65.0, "USD", "USDBankAccount", Some("Relative"),       None,                   None,          "Entertainment",     "2023-02-01", Expected::Success), // USDBankAccount 1065 - Gets archived
-            ("Convert", 400.0, "EGP", "USDWallet",      None,                   Some("JPYWallet"),      Some(61877.0), "RecurringExpenses", "2023-03-01", Expected::BadRequest), // The EGP currency in this entry is ambiguous
-            ("Spend",    90.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-04-01", Expected::Success), // JPYBankAccount 136431.784108
-            ("Income",  200.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-01", Expected::Success), // JPYWallet 179910.044977
-            ("Lend",     75.0, "USD", "EGPBankAccount", Some("Associate"),      None,                   None,          "LivingExpenses",    "2023-06-01", Expected::Success), // EGPBankAccount 46250
-            ("Borrow",   85.0, "USD", "EGPWallet",      Some("Partner"),        None,                   None,          "Purchases",         "2023-07-01", Expected::Success), // EGPWallet 54250
-            ("Convert", 500.0, "JPY", "JPYWallet",      None,                   Some("JPYBankAccount"), Some(400.0),   "Entertainment",     "2023-08-01", Expected::Success), // JPYWallet 179410.044977 JPYBankAccount 136831.784108 - This conversion should just lose me money, but it should be valid
-            ("Spend",   100.0, "USD", "USDBankAccount", None,                   None,                   None,          "LivingExpenses",    "2023-01-01", Expected::Success), // USDBankAccount 965 - Gets archived
-            ("Income",  200.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-02-01", Expected::Success), // USDWallet 1200 - Gets deleted
-            ("Lend",     50.0, "USD", "USDBankAccount", Some("John Doe"),       None,                   None,          "Purchases",         "2023-03-01", Expected::Success), // USDBankAccount 915 - Gets deleted
-            ("Borrow",   75.0, "USD", "USDWallet",      Some("Jane Doe"),       None,                   None,          "Entertainment",     "2023-04-01", Expected::Success), // USDWallet 1275
-            ("Convert", 500.0, "USD", "USDBankAccount", None,                   Some("EGPWallet"),      None,          "LivingExpenses",    "2023-05-01", Expected::BadRequest), // Convert without secondary source amount
-            ("Spend",   120.0, "USD", "EGPBankAccount", None,                   None,                   None,          "Purchases",         "2023-06-01", Expected::Success), // EGPBankAccount 40250
-            ("Income",  130.0, "USD", "EGPWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-07-01", Expected::Success), // EGPWallet 60750
-            ("Lend",     80.0, "USD", "JPYBankAccount", Some("Friend"),         None,                   None,          "Entertainment",     "2023-08-01", Expected::Success), // JPYBankAccount 124837.781109
-            ("Borrow",   90.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-09-01", Expected::BadRequest), // Borrow / lend needs target
-            ("Convert", 200.0, "JPY", "JPYWallet",      None,                   Some("EGPBankAccount"), None,          "Purchases",         "2023-10-01", Expected::BadRequest), // Secondary source amount required on convert
-            ("Spend",   110.0, "USD", "USDWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-11-01", Expected::Success), // USDWallet 1165
-            ("Income",  115.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-12-01", Expected::Success), // JPYBankAccount 142079.160419
-            ("Lend",     85.0, "USD", "USDWallet",      Some("Neighbor"),       None,                   None,          "Purchases",         "2024-01-01", Expected::Success), // USDWallet 1080
+            ("Income", 1000.0, "USD", "EGPBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-02", Expected::Success),
+            ("Income", 1000.0, "USD", "USDBankAccount", None,                   None,                   None,          "RecurringExpenses", "2023-05-03", Expected::Success),
+            ("Income", 1000.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-04", Expected::Success),
+            ("Income", 1000.0, "USD", "EGPWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-05", Expected::Success),
+            ("Income", 1000.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-06", Expected::Success),
+            ("Borrow",   65.0, "USD", "USDBankAccount", Some("Relative"),       None,                   None,          "Entertainment",     "2023-02-07", Expected::Success), // USDBankAccount 1065 - Gets archived
+            ("Convert", 400.0, "EGP", "USDWallet",      None,                   Some("JPYWallet"),      Some(61877.0), "RecurringExpenses", "2023-03-08", Expected::BadRequest), // The EGP currency in this entry is ambiguous
+            ("Spend",    90.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-04-09", Expected::Success), // JPYBankAccount 136431.784108
+            ("Income",  200.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-05-10", Expected::Success), // JPYWallet 179910.044977
+            ("Lend",     75.0, "USD", "EGPBankAccount", Some("Associate"),      None,                   None,          "LivingExpenses",    "2023-06-11", Expected::Success), // EGPBankAccount 46250
+            ("Borrow",   85.0, "USD", "EGPWallet",      Some("Partner"),        None,                   None,          "Purchases",         "2023-07-12", Expected::Success), // EGPWallet 54250
+            ("Convert", 500.0, "JPY", "JPYWallet",      None,                   Some("JPYBankAccount"), Some(400.0),   "Entertainment",     "2023-08-13", Expected::Success), // JPYWallet 179410.044977 JPYBankAccount 136831.784108 - This conversion should just lose me money, but it should be valid
+            ("Spend",   100.0, "USD", "USDBankAccount", None,                   None,                   None,          "LivingExpenses",    "2023-01-14", Expected::Success), // USDBankAccount 965 - Gets archived
+            ("Income",  200.0, "USD", "USDWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-02-15", Expected::Success), // USDWallet 1200 - Gets deleted
+            ("Lend",     50.0, "USD", "USDBankAccount", Some("John Doe"),       None,                   None,          "Purchases",         "2023-03-16", Expected::Success), // USDBankAccount 915 - Gets deleted
+            ("Borrow",   75.0, "USD", "USDWallet",      Some("Jane Doe"),       None,                   None,          "Entertainment",     "2023-04-17", Expected::Success), // USDWallet 1275
+            ("Convert", 500.0, "USD", "USDBankAccount", None,                   Some("EGPWallet"),      None,          "LivingExpenses",    "2023-05-18", Expected::BadRequest), // Convert without secondary source amount
+            ("Spend",   120.0, "USD", "EGPBankAccount", None,                   None,                   None,          "Purchases",         "2023-06-19", Expected::Success), // EGPBankAccount 40250
+            ("Income",  130.0, "USD", "EGPWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-07-20", Expected::Success), // EGPWallet 60750
+            ("Lend",     80.0, "USD", "JPYBankAccount", Some("Friend"),         None,                   None,          "Entertainment",     "2023-08-21", Expected::Success), // JPYBankAccount 124837.781109
+            ("Borrow",   90.0, "USD", "JPYWallet",      None,                   None,                   None,          "RecurringExpenses", "2023-09-22", Expected::BadRequest), // Borrow / lend needs target
+            ("Convert", 200.0, "JPY", "JPYWallet",      None,                   Some("EGPBankAccount"), None,          "Purchases",         "2023-10-23", Expected::BadRequest), // Secondary source amount required on convert
+            ("Spend",   110.0, "USD", "USDWallet",      None,                   None,                   None,          "LivingExpenses",    "2023-11-24", Expected::Success), // USDWallet 1165
+            ("Income",  115.0, "USD", "JPYBankAccount", None,                   None,                   None,          "Entertainment",     "2023-12-25", Expected::Success), // JPYBankAccount 142079.160419
+            ("Lend",     85.0, "USD", "USDWallet",      Some("Neighbor"),       None,                   None,          "Purchases",         "2024-01-26", Expected::Success), // USDWallet 1080
         ];
 
         for (
@@ -758,8 +756,6 @@ mod tests {
             (EntryQuery { max_amount_in_fixed: Some(120.0), ..Default::default() }, 13),
             (EntryQuery { currencies: Some(vec!["EGP".to_string()]), ..Default::default() }, 0),
             (EntryQuery { currencies: Some(vec!["JPY".to_string()]), ..Default::default() }, 1),
-                // could not deserialize body into a money_rs::handlers::FindEntriesResponse
-                // err: invalid type: null, expected f64 at line 1 column 42
             (EntryQuery { sources: Some(vec!["JPYBankAccount".to_string()]), ..Default::default()}, 4),
         ];
         let filters_qs =
@@ -858,14 +854,40 @@ mod tests {
             );
         }
 
+        // 13. category stats – for “Entertainment” there are no entries in 2024-08-01…2025-08-01
+        let res: TestResponse<CategoryStatsResponse> =
+            run_req(&app, Method::GET, "/api/category/Entertainment/stats?now=2023-12-05", t, None)
+                .await;
+        assert_response_status_is_success(&res);
+        let stats = res.body.expect("Expected CategoryStatsResponse");
+
+        // sum over past 12 months (2024-08 through 2025-07) is 0
+        assert!(
+            (stats.year_sum_in_fixed - 313.335).abs() < consts::EPSILON,
+            "expected year_sum_in_fixed 313.335, got {}",
+            stats.year_sum_in_fixed
+        );
+        // average = sum/12 = 0
+        assert!(
+            (stats.monthly_average_in_fixed - 26.11125).abs() < consts::EPSILON,
+            "expected monthly_average_in_fixed 26.11125, got {}",
+            stats.monthly_average_in_fixed
+        );
+        // breakdown must be twelve zeros
+        assert_eq!(
+            stats.month_breakdown_in_fixed,
+            vec![0.0, 0.0, 65.0, 0.0, 165.0, 0.0, 0.0, 0.0, 83.335, 0.0, 0.0, 0.0,]
+        );
+        // current month (2025-08) sum = 0
+        assert!(
+            (stats.current_month_in_fixed - 115.0).abs() < consts::EPSILON,
+            "expected current_month_in_fixed 115.0, got {}",
+            stats.current_month_in_fixed
+        );
+        // no “largest spends” in the empty window
+        assert!(stats.year_largest_spends.len() == 6);
+
         // TODO(40): TEST: Test newly implemented endpoints:
-        //  - Get currency's entries
-        //  - Get source's entries
-        //  - Get category's entries
-        //  - ^ those three should allow ?page (0-based) and ?page_size
-        //  - neither specified defaults to returning 500 entries
-        //  - page specified -> page_size defaults to returning 100
-        //  - page_size specified -> page defaults to 0
         //  - Get a currency's sources
         //  - Update entries by ids (bulk update entries)
     }

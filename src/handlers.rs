@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use ::pbkdf2::Pbkdf2;
 use actix_web::{HttpRequest, HttpResponse, web};
-use diesel::query_builder::BoxedSelectStatement;
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, OffsetDsl, OrderDsl, SelectDsl};
 use diesel::{
     BelongingToDsl, BoolExpressionMethods, ExpressionMethods, SelectableHelper, insert_into,
@@ -21,7 +20,7 @@ use crate::consts;
 use crate::consts::Conn;
 use crate::env_vars::page_size;
 use crate::http::{ArrayQuery, internal};
-use crate::model::{EntryType, GetById};
+use crate::model::{EntryType, GetById, GetByNameAndUser};
 #[allow(unused_imports)]
 use crate::{
     AppState,
@@ -50,6 +49,21 @@ pub struct CreateResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EmptyResponse {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CategoryStatsRequest {
+    now: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CategoryStatsResponse {
+    pub year_sum_in_fixed: f64,
+    pub monthly_average_in_fixed: f64,
+    pub month_breakdown_in_fixed: Vec<f64>,
+    pub current_month_in_fixed: f64,
+    pub year_largest_spends: Vec<EntryResponse>,
+}
 
 /// Used only when performing group-operation on entries (not entities).
 /// Examples are deleting and archiving and block-updating entries.
@@ -415,7 +429,7 @@ macro_rules! get_all_handler {
                 Err(e) => {
                     return internal(
                         e,
-                        format!("E003: Failed to get all {}", $ent::specifier_plural()).as_str(),
+                        format!("E003: Failed to get all {}", $ent::specifier_plural()),
                     )
                 }
                 Ok(f) => f,
@@ -461,6 +475,7 @@ get_all_handler!(
     )
 );
 
+#[allow(dead_code)]
 pub async fn unimplemented(
     _app_state: web::Data<AppState>,
     _user: web::ReqData<User>,
@@ -475,29 +490,24 @@ macro_rules! get_by_name_handler {
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
-            use crate::schema::$tb_name::dsl::*;
             let user = user.into_inner();
             let app_state = app_state.into_inner();
             let path_name = path_name.into_inner();
-            let fetched = match $ent::belonging_to(&user)
-                .filter(name.eq(&path_name))
-                .select($ent::as_select())
-                .first(&mut app_state.cpool().await)
-                .await
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    if matches!(e, diesel::result::Error::NotFound) {
-                        return HttpResponse::NotFound()
-                            .body(format!("{} not found", $ent::specifier()));
-                    } else {
-                        return internal(
-                            e,
-                            format!("E015: Failed to get {} by name", <$ent>::specifier()),
-                        );
+            let fetched =
+                match $ent::get_by_name_and_user(path_name, &user, app_state.clone()).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if matches!(e, diesel::result::Error::NotFound) {
+                            return HttpResponse::NotFound()
+                                .body(format!("{} not found", $ent::specifier()));
+                        } else {
+                            return internal(
+                                e,
+                                format!("E015: Failed to get {} by name", <$ent>::specifier()),
+                            );
+                        }
                     }
-                }
-            };
+                };
             let response = $resp::stateful_try_from(fetched, &user, app_state.clone()).await;
             match response {
                 Err(e) => HttpResponse::from(e),
@@ -510,6 +520,136 @@ macro_rules! get_by_name_handler {
 get_by_name_handler!(get_currency_by_name, currencies, Currency, CurrencyResponse);
 get_by_name_handler!(get_source_by_name, sources, Source, SourceResponse);
 get_by_name_handler!(get_category_by_name, categories, Category, CategoryResponse);
+
+pub async fn get_category_stats(
+    web::Query(req): web::Query<CategoryStatsRequest>,
+    path_name: web::Path<String>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use chrono::Datelike;
+    let now = if let Some(req_now) = req.now
+        && let Ok(req_now) = chrono::NaiveDate::parse_from_str(req_now.as_str(), "%Y-%m-%d")
+    {
+        req_now
+    } else {
+        chrono::Utc::now().date_naive()
+    };
+
+    let user = user.into_inner();
+    let app_state = app_state.into_inner();
+    let path_name = path_name.into_inner();
+    let fetched = match Category::get_by_name_and_user(&path_name, &user, app_state.clone()).await {
+        Ok(f) => f,
+        Err(e) => {
+            if matches!(e, diesel::result::Error::NotFound) {
+                return HttpResponse::NotFound()
+                    .body(format!("{} not found", Category::specifier()));
+            } else {
+                return internal(
+                    e,
+                    format!("E022: Failed to get {} by name", Category::specifier()),
+                );
+            }
+        }
+    };
+    use crate::schema::entries::dsl::*;
+    let start_of_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+        .expect("Every month should have a start");
+    let year_ago = chrono::NaiveDate::from_ymd_opt(now.year() - 1, now.month(), 1)
+        .expect("Every month should have a start");
+    let found: Vec<Entry> = match entries
+        .filter(
+            category_id
+                .eq(fetched.id)
+                .and(date.ge(chrono::NaiveDateTime::from(year_ago)))
+                .and(date.lt(chrono::NaiveDateTime::from(start_of_month))),
+        )
+        .order(date.asc())
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E027: Failed to get {} for category {}",
+                    Entry::specifier_plural(),
+                    &path_name
+                ),
+            );
+        }
+    };
+    let year_sum_in_fixed: f64 = found.iter().map(|e| e.amount_in_fixed).sum();
+    // Order months from same-month last year to the month before this one
+    let chunked_by_month =
+        found.iter().chunk_by(|item| (12u32 + item.date.month() - now.month()) % 12);
+    let mut month_breakdown_in_fixed = vec![0.0f64; 12];
+    chunked_by_month.into_iter().for_each(|(month, g)| {
+        month_breakdown_in_fixed[month as usize] = g.map(|e| e.amount_in_fixed).sum()
+    });
+
+    let found: Vec<Entry> = match entries
+        .filter(
+            category_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(start_of_month))),
+        )
+        .order(date.asc())
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E028: Failed to get {} for category {}",
+                    Entry::specifier_plural(),
+                    &path_name
+                ),
+            );
+        }
+    };
+    let current_month_in_fixed: f64 = found.iter().map(|e| e.amount_in_fixed).sum();
+
+    let found: Vec<Entry> = match entries
+        .filter(category_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(year_ago))))
+        .order(amount_in_fixed.desc())
+        .limit(10)
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E027: Failed to get {} for category {}",
+                    Entry::specifier_plural(),
+                    &path_name
+                ),
+            );
+        }
+    };
+
+    let year_largest_spends: Vec<EntryResponse> = join_all(
+        found
+            .into_iter()
+            .map(async |e| EntryResponse::stateful_try_from(e, &user, app_state.clone()).await),
+    )
+    .await
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
+    let response = CategoryStatsResponse {
+        year_sum_in_fixed,
+        monthly_average_in_fixed: year_sum_in_fixed / 12.0f64,
+        month_breakdown_in_fixed,
+        current_month_in_fixed,
+        year_largest_spends,
+    };
+    HttpResponse::Ok().json(response)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -652,7 +792,7 @@ pub async fn delete_entries(
         Err(e) => {
             return internal(
                 e,
-                format!("E016: Failed to get {} for deletion", Entry::specifier_plural()).as_str(),
+                format!("E016: Failed to get {} for deletion", Entry::specifier_plural()),
             );
         }
         Ok(f) => f,
@@ -764,7 +904,7 @@ update_handler!(update_source, sources, Source, UpdateSource, UpdateSourceReques
 update_handler!(update_category, categories, Category, UpdateCategory, UpdateCategoryRequest);
 
 pub async fn update_entry(
-    path_id: web::Path<i32>,
+    ArrayQuery(req): ArrayQuery<BulkRequest>,
     app_state: web::Data<AppState>,
     data: web::Json<UpdateEntryRequest>,
     user: web::ReqData<User>,
@@ -772,23 +912,17 @@ pub async fn update_entry(
     use crate::schema::entries::dsl::*;
     let user = user.into_inner();
     let app_state = app_state.into_inner();
-    let path_id = path_id.into_inner();
     let data = data.into_inner();
     let change_set = match UpdateEntry::stateful_try_from(data, &user, app_state.clone()).await {
         Err(e) => return HttpResponse::from(e),
         Ok(c) => c,
     };
-    match diesel::update(Entry::belonging_to(&user).filter(id.eq(path_id)))
+    match diesel::update(Entry::belonging_to(&user).filter(id.eq_any(req.ids)))
         .set(change_set)
         .execute(&mut app_state.cpool().await)
         .await
     {
-        Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
-        Ok(0) => HttpResponse::NotFound().finish(),
-        Ok(2..) => internal(
-            "No underlying error",
-            format!("E010: Updated more than one {}", Entry::specifier()),
-        ),
+        Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
         Err(e) => internal(e, format!("E011: Could not update {}", Entry::specifier())),
     }
 }
@@ -811,8 +945,13 @@ macro_rules! archive_handler {
                 .await
             {
                 Ok(f) => f,
-                Err(_) => {
-                    return HttpResponse::NotFound().body(format!("{} not found", $ent::specifier()))
+                Err(e) => {
+                    if matches!(e, diesel::result::Error::NotFound) {
+                        return HttpResponse::NotFound()
+                            .body(format!("{} not found", $ent::specifier()));
+                    } else {
+                        return internal(e, format!("E023: Could not fetch {}", $ent::specifier()));
+                    }
                 }
             };
             let net_amount = match fetched.get_net_amount(app_state.clone()).await {
@@ -831,11 +970,9 @@ macro_rules! archive_handler {
                 Ok(0) => HttpResponse::NotFound().finish(),
                 Ok(2..) => internal(
                     "No underlying error",
-                    format!("E012: Archived more than one {}", $ent::specifier()).as_str(),
+                    format!("E012: Archived more than one {}", $ent::specifier()),
                 ),
-                Err(e) => {
-                    internal(e, format!("E013: Could not archive {}", $ent::specifier()).as_str())
-                }
+                Err(e) => internal(e, format!("E013: Could not archive {}", $ent::specifier())),
             }
         }
     };
@@ -882,12 +1019,16 @@ macro_rules! get_entries_for {
                 .await
             {
                 Ok(p) => p,
-                Err(_) => {
-                    return HttpResponse::NotFound().body(format!(
-                        "{} {} not found",
-                        $ent::specifier(),
-                        path_name
-                    ))
+                Err(e) => {
+                    if matches!(e, diesel::result::Error::NotFound) {
+                        return HttpResponse::NotFound().body(format!(
+                            "{} {} not found",
+                            $ent::specifier(),
+                            path_name
+                        ));
+                    } else {
+                        return internal(e, format!("E024: Could not fetch {}", $ent::specifier()));
+                    }
                 }
             };
 
@@ -914,7 +1055,7 @@ macro_rules! get_entries_for {
                 }
                 Err(e) => internal(
                     e,
-                    format!("E020: Failed to get entries for {} {}", $ent::specifier(), path_name),
+                    format!("E010: Failed to get entries for {} {}", $ent::specifier(), path_name),
                 ),
             }
         }
@@ -928,6 +1069,64 @@ get_entries_for!(get_currency_entries, currencies, Currency, |input_id| {
 get_entries_for!(get_category_entries, categories, Category, |input_id| {
     crate::schema::entries::dsl::category_id.eq(input_id)
 },);
+
+pub async fn get_currency_sources(
+    web::Query(req): web::Query<SimplePaginatedRequest>,
+    path_name: web::Path<String>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    let app_state = app_state.into_inner();
+    let user = user.into_inner();
+    let path_name = path_name.into_inner();
+
+    let parent = match Currency::belonging_to(&user)
+        .filter(crate::schema::currencies::dsl::name.eq(&path_name))
+        .first::<Currency>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            if matches!(e, diesel::result::Error::NotFound) {
+                return HttpResponse::NotFound().body(format!(
+                    "{} {} not found",
+                    Currency::specifier(),
+                    path_name
+                ));
+            } else {
+                return internal(e, format!("E025: Could not fetch {}", Currency::specifier()));
+            }
+        }
+    };
+
+    // Boxing the query allows us to mutate it without changing its type.
+    let mut query = diesel::QueryDsl::into_boxed(
+        Source::belonging_to(&user).filter(crate::schema::sources::dsl::currency_id.eq(parent.id)),
+    );
+    if let Some(page) = req.page {
+        query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
+    }
+    let found = query.load::<Source>(&mut app_state.cpool().await).await;
+
+    match found {
+        Ok(sources) => {
+            let out = join_all(
+                sources
+                    .into_iter()
+                    .map(|s| SourceResponse::stateful_try_from(s, &user, app_state.clone())),
+            )
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+            HttpResponse::Ok().json(out)
+        }
+        Err(e) => internal(
+            e,
+            format!("E021: Failed to get sources for {} {}", Currency::specifier(), path_name),
+        ),
+    }
+}
 
 pub async fn get_source_entries(
     web::Query(req): web::Query<SourceEntriesRequest>,
@@ -946,12 +1145,16 @@ pub async fn get_source_entries(
         .await
     {
         Ok(p) => p,
-        Err(_) => {
-            return HttpResponse::NotFound().body(format!(
-                "{} {} not found",
-                Source::specifier(),
-                path_name
-            ));
+        Err(e) => {
+            if matches!(e, diesel::result::Error::NotFound) {
+                return HttpResponse::NotFound().body(format!(
+                    "{} {} not found",
+                    Source::specifier(),
+                    path_name
+                ));
+            } else {
+                return internal(e, format!("E026: Could not fetch {}", Source::specifier()));
+            }
         }
     };
 
@@ -1074,6 +1277,7 @@ Front end should allow:
 
 # Sources functionality
 - TODO(80): DESIGN: decide the rest of sources functionality
+- FE Currency should display: The balance exists in the following sources: <_>
 
 # General front-end
 - Tables

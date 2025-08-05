@@ -1,0 +1,43 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'money-rs'",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=money-rs",
+          "--package=money-rs"
+        ],
+        "filter": {
+          "name": "money-rs",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'money-rs'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--bin=money-rs",
+          "--package=money-rs"
+        ],
+        "filter": {
+          "name": "money-rs",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

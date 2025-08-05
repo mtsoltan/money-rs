@@ -87,9 +87,12 @@ impl<T: DeserializeOwned> FromRequest for ArrayQuery<T> {
 /// copied-on-demand strings for this.
 pub fn internal<T: Into<String>>(debuggable: impl Debug, e: T) -> HttpResponse {
     let e = e.into();
-    // TODO(30): BUG: Check why the error logs are not showing up in tests (and if they'll show up
-    //  live)
-    // TODO(50): LOGIC: Add parameter array of impl debug and debug them here in the error
-    error!("{}:\n{:?}", e, debuggable);
+    log::log!(
+        target: "internal",
+        log::Level::Error,
+        "{}:\n{:?}",
+        e, debuggable
+    );
+
     HttpResponse::InternalServerError().body(e)
 }
