@@ -45,14 +45,6 @@ fn pool() -> Pool {
     Pool::builder(manager).build().expect("Failed to create pool")
 }
 
-// TODO(10): Use moneta with fpdec, find a way for fpdec to be the postgres-types numeric
-//  https://docs.rs/postgres-types/latest/postgres_types/
-//  https://docs.rs/fpdec/latest/fpdec/
-//  https://docs.rs/moneta/latest/moneta/type.AmountT.html
-//  https://docs.rs/moneta/latest/moneta/struct.Decimal.html
-//  rust-decimal supports posgres numeric out of the box, but it has 96-bit precision instead of
-// 128-bit  https://docs.rs/rust_decimal/1.37.2/rust_decimal/#db-postgres
-
 fn app(
     pool: Pool,
 ) -> App<

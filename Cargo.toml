@@ -40,7 +40,8 @@ approx = { package = "approxim", version = "0.6.1" }
 diesel-async = { version = "0.6.1", features = ["postgres", "pool", "deadpool"] }
 async-trait = "0.1.88"
 fpdec = { version = "0.11.0", features = ["std", "serde-as-str", "num-traits"]}
-moneta = { version = "0.5.1", features = ["std", "serde"] }
+byteorder = { version ="1.5.0", features = ["i128"] }
+# moneta = { version = "0.5.1", features = ["std", "serde"] }
 
 [features]
 default = []

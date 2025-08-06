@@ -21,7 +21,7 @@ use {
 };
 use diesel_async::RunQueryDsl as _;
 
-use crate::numeric::{Numeric, fpdec_to_pg};
+use crate::numeric::Numeric;
 
 #[derive(Debug, PartialEq, Clone, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
 #[ExistingTypePath = "EntryT"]
@@ -640,7 +640,7 @@ pub struct Entry {
 }
 
 fn convert_currency<T: Into<Decimal>>(amount: T, from: &Currency, to: &Currency) -> Decimal {
-    from.rate_to_fixed.dec() / to.rate_to_fixed.dec() * amount.into()
+    from.rate_to_fixed / to.rate_to_fixed * amount.into()
 }
 
 #[async_trait]
@@ -692,7 +692,7 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
             (None, None) => value.amount,
         };
         // 100 * 0.02 = 2 USD (exact to rate)
-        let amount_in_fixed = value.amount * &currency.rate_to_fixed;
+        let amount_in_fixed = value.amount * currency.rate_to_fixed;
         let conversion_rate;
         let conversion_rate_to_fixed;
         let mut secondary_source_id = None;
@@ -740,8 +740,8 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                 // Anything that uses this will not be exact unless either currency or primary is
                 // fixed. Therefore, this should never be used, we should always
                 // rely on source amount.
-                conversion_rate = &primary_source_currency.rate_to_fixed
-                    / &secondary_source_currency.rate_to_fixed;
+                conversion_rate = primary_source_currency.rate_to_fixed
+                    / secondary_source_currency.rate_to_fixed;
                 conversion_rate_to_fixed = secondary_source_currency.rate_to_fixed;
             }
             e => {
@@ -761,7 +761,7 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                     );
                 }
                 // From the specified value currency to the primary source's.
-                conversion_rate = &currency.rate_to_fixed / &primary_source_currency.rate_to_fixed;
+                conversion_rate = currency.rate_to_fixed / primary_source_currency.rate_to_fixed;
                 conversion_rate_to_fixed = primary_source_currency.rate_to_fixed.clone();
             }
         };
@@ -961,24 +961,24 @@ impl Entry {
             query = query.filter(category_id.eq_any(ids));
         }
 
-        if let Some(q_amount) = &query_params.amount {
-            query = query.filter(amount.eq(fpdec_to_pg(q_amount)));
+        if let Some(q_amount) = query_params.amount {
+            query = query.filter(amount.eq(Numeric::from(q_amount)));
         }
 
         if let Some(min_amount) = query_params.min_amount {
-            query = query.filter(amount.ge(fpdec_to_pg(&min_amount)));
+            query = query.filter(amount.ge(Numeric::from(min_amount)));
         }
 
         if let Some(max_amount) = query_params.max_amount {
-            query = query.filter(amount.le(fpdec_to_pg(&max_amount)));
+            query = query.filter(amount.le(Numeric::from(max_amount)));
         }
 
         if let Some(min_amount_in_fixed) = query_params.min_amount_in_fixed {
-            query = query.filter(amount_in_fixed.ge(fpdec_to_pg(&min_amount_in_fixed)));
+            query = query.filter(amount_in_fixed.ge(Numeric::from(min_amount_in_fixed)));
         }
 
         if let Some(max_amount_in_fixed) = query_params.max_amount_in_fixed {
-            query = query.filter(amount_in_fixed.le(fpdec_to_pg(&max_amount_in_fixed)));
+            query = query.filter(amount_in_fixed.le(Numeric::from(max_amount_in_fixed)));
         }
 
         if let Some(q_date) = &query_params.date {

@@ -87,4 +87,10 @@ diesel::joinable!(entries -> users (user_id));
 diesel::joinable!(sources -> currencies (currency_id));
 diesel::joinable!(sources -> users (user_id));
 
-diesel::allow_tables_to_appear_in_same_query!(categories, currencies, entries, sources, users,);
+diesel::allow_tables_to_appear_in_same_query!(
+    categories,
+    currencies,
+    entries,
+    sources,
+    users,
+);

@@ -739,7 +739,7 @@ async fn update_entry_sources(
     use crate::schema::sources::dsl::*;
 
     match diesel::update(&source)
-        .set(amount.eq(Numeric::from(&source.amount + c1 * c2 * &entry.source_amount)))
+        .set(amount.eq(Numeric::from(source.amount + c1 * c2 * entry.source_amount)))
         .execute(&mut conn)
         .await
     {
@@ -752,10 +752,10 @@ async fn update_entry_sources(
         }
         Ok(_) => {}
     };
-    if let Some(a) = &entry.secondary_source_amount
+    if let Some(a) = entry.secondary_source_amount
         && let Some(ss) = secondary_source
     {
-        match diesel::update(&ss).set(amount.eq(Numeric::from(&ss.amount + c1 * a))).execute(&mut conn).await {
+        match diesel::update(&ss).set(amount.eq(Numeric::from(ss.amount + c1 * a))).execute(&mut conn).await {
             Err(e) => {
                 return Err(UpdateEntrySourcesError::UpdateError {
                     entry_id: entry.id,
