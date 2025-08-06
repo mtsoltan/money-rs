@@ -828,17 +828,26 @@ mod tests {
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/currency/JPY/entries", t, None).await;
         assert_response_status_is_success(&res);
-        assert!(res.body.unwrap().iter().all(|e| e.currency == "JPY"));
+        assert!(
+            res.body.expect("Expected entries in response").iter().all(|e| e.currency == "JPY")
+        );
 
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/source/JPYWallet/entries", t, None).await;
         assert_response_status_is_success(&res);
-        assert!(res.body.unwrap().iter().all(|e| e.source == "JPYWallet"));
+        assert!(
+            res.body.expect("Expected entries in response").iter().all(|e| e.source == "JPYWallet")
+        );
 
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/category/Entertainment/entries", t, None).await;
         assert_response_status_is_success(&res);
-        assert!(res.body.unwrap().iter().all(|e| e.category == "Entertainment"));
+        assert!(
+            res.body
+                .expect("Expected entries in response")
+                .iter()
+                .all(|e| e.category == "Entertainment")
+        );
 
         // 12. Ensure that sources with deleted entries get their amounts returned
         for (source, final_amount) in

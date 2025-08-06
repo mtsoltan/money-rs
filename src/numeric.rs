@@ -23,7 +23,12 @@ impl Numeric {
 }
 
 impl From<PgNumeric> for Numeric {
-    fn from(value: PgNumeric) -> Self { Numeric(pg_to_fpdec(&value).unwrap()) }
+    // TODO(60): Actual error handling here for the case in which a maliciously crafted numeric is
+    //  manually added to the database somehow, and fails to convert to fpdec due to being large /
+    //  having high precision, and fails digits.len() check or digits_after_decimal_dot check.
+    fn from(value: PgNumeric) -> Self {
+        Numeric(pg_to_fpdec(&value).expect("This conversion should almost always succeed"))
+    }
 }
 
 impl From<Decimal> for Numeric {
@@ -97,7 +102,12 @@ impl ToSql<sql_types::Numeric, Pg> for Numeric {
     ) -> diesel::serialize::Result {
         use byteorder::{NetworkEndian, WriteBytesExt};
         use diesel::serialize::IsNull;
-        let pg_numeric = fpdec_to_pg(&self.0).unwrap();
+        // TODO(60): Actual error handling here for the case in which a maliciously crafted request
+        //  has an fpdec that has a decimal point in a position such that it triggers multiplication
+        //  by 10 multiple times to overflow fpdec::Decimal's capability before it's turned into
+        //  PgNumeric, and fails checked_mul.
+        let pg_numeric =
+            fpdec_to_pg(&self.0).expect("This conversion should almost always succeed");
 
         let sign = match pg_numeric {
             PgNumeric::Positive { .. } => 0,
@@ -282,32 +292,32 @@ mod tests {
     fn integer_simple() {
         let pg = PgNumeric::Positive { weight: 0, scale: 0, digits: vec![42] };
         let fpdec = Dec!(42);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 
     #[test]
     fn integer_multi_group() {
         let pg = PgNumeric::Positive { weight: 0, scale: 2, digits: vec![123, 4500] };
         let fpdec = Dec!(123.45);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 
     #[test]
     fn fractional_exact_group() {
         let pg = PgNumeric::Positive { weight: -1, scale: 4, digits: vec![1] };
         let fpdec = Dec!(0.0001);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), Dec!(0.0001));
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 
     #[test]
     fn negative_fraction() {
         let pg = PgNumeric::Negative { weight: -1, scale: 4, digits: vec![1] };
         let fpdec = Dec!(-0.0001);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), Dec!(-0.0001));
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 
     #[test]
@@ -318,8 +328,8 @@ mod tests {
             digits: vec![17, 141, 1834, 6046, 9231, 7316, 8730, 3715, 8841, 500],
         };
         let fpdec = Dec!(-170141183460469231731687303715.884105);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 
     #[test]
@@ -330,8 +340,8 @@ mod tests {
             digits: vec![1, 7014, 1183, 4604, 6923, 1731, 6873, 371, 5884, 1050],
         };
         let fpdec = Dec!(-17014118346046923173168730371.5884105);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 
     // fails - does not overflow
@@ -342,7 +352,7 @@ mod tests {
             scale: 7,
             digits: vec![1, 7014, 1183, 4604, 6923, 1731, 6873, 371, 5884, 1051],
         };
-        assert_eq!(pg_to_fpdec(&pg).unwrap_err(), ParseDecimalError::InternalOverflow);
+        assert_eq!(pg_to_fpdec(&pg), Err(ParseDecimalError::InternalOverflow));
     }
 
     #[test]
@@ -352,7 +362,7 @@ mod tests {
             scale: 7,
             digits: vec![170, 1411, 8346, 0469, 2317, 3168, 7303, 7158, 8410, 5728],
         };
-        assert_eq!(pg_to_fpdec(&pg).unwrap_err(), ParseDecimalError::InternalOverflow);
+        assert_eq!(pg_to_fpdec(&pg), Err(ParseDecimalError::InternalOverflow));
     }
 
     #[test]
@@ -362,15 +372,15 @@ mod tests {
             scale: 20,
             digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4105],
         };
-        assert_eq!(pg_to_fpdec(&pg).unwrap_err(), ParseDecimalError::FracDigitLimitExceeded);
+        assert_eq!(pg_to_fpdec(&pg), Err(ParseDecimalError::FracDigitLimitExceeded));
     }
 
     #[test]
     fn numbers_with_negative_quads_succeed() {
         let pg = PgNumeric::Positive { weight: 1, scale: 0, digits: vec![5] };
         let fpdec = Dec!(50000);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 
     #[test]
@@ -381,8 +391,8 @@ mod tests {
             digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4105],
         };
         let fpdec = Dec!(-170141183460469231731687303715884105);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 
     #[test]
@@ -393,7 +403,7 @@ mod tests {
             digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4106],
         };
         let fpdec = Dec!(-170141183460469231731687303715884106);
-        assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
-        assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
+        assert_eq!(pg_to_fpdec(&pg), Ok(fpdec));
+        assert_eq!(fpdec_to_pg(&fpdec), Ok(pg));
     }
 }
