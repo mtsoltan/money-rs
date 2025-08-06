@@ -34,7 +34,6 @@ fn is_numeric_type(ty: &Type) -> bool {
     false
 }
 
-
 /// ### Details
 ///
 /// From a basic database-faithful model, this macro generates structs for create and update DTOs as
@@ -325,7 +324,6 @@ fn entity_macro_internal(
                 } else {
                     name_type.clone()
                 };
-
 
                 if push_to_response {
                     response_fields.push(quote! { pub #name_ident: #response_type });

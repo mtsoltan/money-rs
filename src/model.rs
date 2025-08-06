@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
-use fpdec::Decimal;
 use diesel::{
     Associations, BelongingToDsl, BoolExpressionMethods, ExpressionMethods, Identifiable,
     Insertable, PgTextExpressionMethods, QueryDsl, Queryable, Selectable,
 };
+use fpdec::Decimal;
 use futures::future::join_all;
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -401,7 +401,11 @@ impl StatefulTryFrom<UpdateCurrencyRequest> for UpdateCurrency {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self { name: value.name, rate_to_fixed: value.rate_to_fixed.map(Numeric::from), archived: value.archived })
+        Ok(Self {
+            name: value.name,
+            rate_to_fixed: value.rate_to_fixed.map(Numeric::from),
+            archived: value.archived,
+        })
     }
 }
 
@@ -412,7 +416,11 @@ impl StatefulTryFrom<Currency> for CurrencyResponse {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self { name: value.name, rate_to_fixed: value.rate_to_fixed.into(), archived: value.archived })
+        Ok(Self {
+            name: value.name,
+            rate_to_fixed: value.rate_to_fixed.into(),
+            archived: value.archived,
+        })
     }
 }
 
@@ -740,8 +748,8 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
                 // Anything that uses this will not be exact unless either currency or primary is
                 // fixed. Therefore, this should never be used, we should always
                 // rely on source amount.
-                conversion_rate = primary_source_currency.rate_to_fixed
-                    / secondary_source_currency.rate_to_fixed;
+                conversion_rate =
+                    primary_source_currency.rate_to_fixed / secondary_source_currency.rate_to_fixed;
                 conversion_rate_to_fixed = secondary_source_currency.rate_to_fixed;
             }
             e => {

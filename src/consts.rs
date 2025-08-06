@@ -1,6 +1,6 @@
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Object;
-use fpdec::{Decimal, Dec};
+use fpdec::{Dec, Decimal};
 
 pub(crate) const EPSILON: Decimal = Dec!(0.00001);
 

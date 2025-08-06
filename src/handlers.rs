@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use fpdec::{Dec, Decimal};
 use ::pbkdf2::Pbkdf2;
 use actix_web::{HttpRequest, HttpResponse, web};
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, OffsetDsl, OrderDsl, SelectDsl};
@@ -11,6 +10,7 @@ use diesel::{
 };
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
+use fpdec::{Dec, Decimal};
 use futures::future::join_all;
 use itertools::Itertools;
 use log::error;
@@ -19,10 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::consts;
 use crate::consts::Conn;
-use crate::numeric::Numeric;
 use crate::env_vars::page_size;
 use crate::http::{ArrayQuery, internal};
 use crate::model::{EntryType, GetById, GetByNameAndUser};
+use crate::numeric::Numeric;
 #[allow(unused_imports)]
 use crate::{
     AppState,
@@ -755,7 +755,11 @@ async fn update_entry_sources(
     if let Some(a) = entry.secondary_source_amount
         && let Some(ss) = secondary_source
     {
-        match diesel::update(&ss).set(amount.eq(Numeric::from(ss.amount + c1 * a))).execute(&mut conn).await {
+        match diesel::update(&ss)
+            .set(amount.eq(Numeric::from(ss.amount + c1 * a)))
+            .execute(&mut conn)
+            .await
+        {
             Err(e) => {
                 return Err(UpdateEntrySourcesError::UpdateError {
                     entry_id: entry.id,

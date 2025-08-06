@@ -1,14 +1,13 @@
 use std::fmt;
-use std::str::FromStr;
 use std::ops::{Add, Div, Mul, Sub};
+use std::str::FromStr;
 
 use diesel::data_types::PgNumeric;
 use diesel::deserialize::FromSql;
 use diesel::pg::{Pg, PgValue};
 use diesel::serialize::ToSql;
 use diesel::{AsExpression, FromSqlRow, sql_types};
-use fpdec::Decimal;
-use fpdec::ParseDecimalError;
+use fpdec::{Decimal, ParseDecimalError};
 use serde::de::{Error, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -20,15 +19,11 @@ pub struct Numeric(Decimal);
 
 impl Numeric {
     /// Equivalent to Into<Decimal>
-    pub fn dec(&self) -> Decimal {
-        self.0
-    }
+    pub fn dec(&self) -> Decimal { self.0 }
 }
 
 impl From<PgNumeric> for Numeric {
-    fn from(value: PgNumeric) -> Self {
-        Numeric(pg_to_fpdec(&value).unwrap())
-    }
+    fn from(value: PgNumeric) -> Self { Numeric(pg_to_fpdec(&value).unwrap()) }
 }
 
 impl From<Decimal> for Numeric {
@@ -52,22 +47,19 @@ impl FromSql<sql_types::Numeric, Pg> for Numeric {
 fn fpdec_to_pg(decimal: &Decimal) -> Result<PgNumeric, ParseDecimalError> {
     let (mut integer, scale) = (decimal.coefficient(), decimal.n_frac_digits());
     if integer == 0 {
-        return Ok(PgNumeric::Positive {
-            digits: vec![0],
-            scale: 0,
-            weight: 0,
-        })
+        return Ok(PgNumeric::Positive { digits: vec![0], scale: 0, weight: 0 });
     }
     let sign = integer > 0;
     integer = integer.abs();
 
     // Ensure that the decimal will always lie on a digit boundary
-    // This may multiply by 1000, which means 1701 4118 3460 4692 3173 1687 3037 1588 4105 is the largest number we can represent without headache.
+    // This may multiply by 1000, which means 1701 4118 3460 4692 3173 1687 3037 1588 4105 is the
+    // largest number we can represent without headache.
 
     for _ in 0..((4 - scale % 4) % 4) {
         integer = match integer.checked_mul(10) {
             Some(r) => r,
-            None => return Err(ParseDecimalError::InternalOverflow)
+            None => return Err(ParseDecimalError::InternalOverflow),
         };
     }
 
@@ -93,16 +85,8 @@ fn fpdec_to_pg(decimal: &Decimal) -> Result<PgNumeric, ParseDecimalError> {
     digits.truncate(relevant_digits);
 
     Ok(match sign {
-        true => PgNumeric::Positive {
-            digits,
-            scale: scale as u16,
-            weight,
-        },
-        false => PgNumeric::Negative {
-            digits,
-            scale: scale as u16,
-            weight,
-        },
+        true => PgNumeric::Positive { digits, scale: scale as u16, weight },
+        false => PgNumeric::Negative { digits, scale: scale as u16, weight },
     })
 }
 
@@ -111,8 +95,7 @@ impl ToSql<sql_types::Numeric, Pg> for Numeric {
         &self,
         out: &mut diesel::serialize::Output<'b, '_, Pg>,
     ) -> diesel::serialize::Result {
-        use byteorder::WriteBytesExt;
-        use byteorder::NetworkEndian;
+        use byteorder::{NetworkEndian, WriteBytesExt};
         use diesel::serialize::IsNull;
         let pg_numeric = fpdec_to_pg(&self.0).unwrap();
 
@@ -166,7 +149,7 @@ impl<'de> Deserialize<'de> for Numeric {
             fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
                 match Decimal::from_str(v) {
                     Ok(e) => Ok(Numeric(e)),
-                    Err(_) => Err(Error::custom(format!("Invalid decimal string")))
+                    Err(_) => Err(Error::custom(format!("Invalid decimal string"))),
                 }
             }
         }
@@ -242,12 +225,12 @@ pub fn pg_to_fpdec(pgn: &PgNumeric) -> Result<Decimal, ParseDecimalError> {
     let (sign, _, weight, digits) = match pgn {
         PgNumeric::NaN => return Err(ParseDecimalError::Invalid),
         PgNumeric::Positive { scale, digits, weight } => (1, *scale, *weight, digits),
-        | PgNumeric::Negative { scale, digits, weight } => (-1, *scale, *weight, digits),
+        PgNumeric::Negative { scale, digits, weight } => (-1, *scale, *weight, digits),
     };
-    // Scale from DB will always be 20 so we can't use it to figure out what's happening to decimals, we rely on weight.
-    // Biggest digit: [1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4105]
-    // Of course, we can store bigger stuff in our decimal by losing precision, but we just error.
-    // Values that are bigger should never make it to our database anyway.
+    // Scale from DB will always be 20 so we can't use it to figure out what's happening to
+    // decimals, we rely on weight. Biggest digit: [1701, 4118, 3460, 4692, 3173, 1687, 3037,
+    // 1588, 4105] Of course, we can store bigger stuff in our decimal by losing precision, but
+    // we just error. Values that are bigger should never make it to our database anyway.
     if digits.len() == 0 {
         return Ok(Decimal::ZERO);
     }
@@ -257,7 +240,7 @@ pub fn pg_to_fpdec(pgn: &PgNumeric) -> Result<Decimal, ParseDecimalError> {
         shifter *= 10;
         i /= 10;
     }
-    if digits.len() > 9 && digits[digits.len() - 1] % shifter != 0  {
+    if digits.len() > 9 && digits[digits.len() - 1] % shifter != 0 {
         return Err(ParseDecimalError::InternalOverflow);
     }
 
@@ -271,7 +254,8 @@ pub fn pg_to_fpdec(pgn: &PgNumeric) -> Result<Decimal, ParseDecimalError> {
         result *= 10_000i128;
         quads_after_decimal_dot += 1;
     }
-    let mut digits_after_decimal_dot = if quads_after_decimal_dot < 0 { 0 } else {quads_after_decimal_dot * 4 };
+    let mut digits_after_decimal_dot =
+        if quads_after_decimal_dot < 0 { 0 } else { quads_after_decimal_dot * 4 };
     if quads_after_decimal_dot > 0 {
         while result % 10 == 0 {
             result /= 10;
@@ -289,9 +273,10 @@ pub fn pg_to_fpdec(pgn: &PgNumeric) -> Result<Decimal, ParseDecimalError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use fpdec::Dec;
     use diesel::data_types::PgNumeric;
+    use fpdec::Dec;
+
+    use super::*;
 
     #[test]
     fn integer_simple() {
@@ -327,7 +312,11 @@ mod tests {
 
     #[test]
     fn on_edge() {
-        let pg = PgNumeric::Negative { weight: 7, scale: 6, digits: vec![17, 141, 1834, 6046, 9231, 7316, 8730, 3715, 8841, 500] };
+        let pg = PgNumeric::Negative {
+            weight: 7,
+            scale: 6,
+            digits: vec![17, 141, 1834, 6046, 9231, 7316, 8730, 3715, 8841, 500],
+        };
         let fpdec = Dec!(-170141183460469231731687303715.884105);
         assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
         assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
@@ -335,7 +324,11 @@ mod tests {
 
     #[test]
     fn on_edge_single_way() {
-        let pg = PgNumeric::Negative { weight: 7, scale: 7, digits: vec![1, 7014, 1183, 4604, 6923, 1731, 6873, 371, 5884, 1050] };
+        let pg = PgNumeric::Negative {
+            weight: 7,
+            scale: 7,
+            digits: vec![1, 7014, 1183, 4604, 6923, 1731, 6873, 371, 5884, 1050],
+        };
         let fpdec = Dec!(-17014118346046923173168730371.5884105);
         assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
         assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
@@ -344,19 +337,31 @@ mod tests {
     // fails - does not overflow
     #[test]
     fn overflow_single_way() {
-        let pg = PgNumeric::Negative { weight: 7, scale: 7, digits: vec![1, 7014, 1183, 4604, 6923, 1731, 6873, 371, 5884, 1051] };
+        let pg = PgNumeric::Negative {
+            weight: 7,
+            scale: 7,
+            digits: vec![1, 7014, 1183, 4604, 6923, 1731, 6873, 371, 5884, 1051],
+        };
         assert_eq!(pg_to_fpdec(&pg).unwrap_err(), ParseDecimalError::InternalOverflow);
     }
 
     #[test]
     fn overflow_big_number() {
-        let pg = PgNumeric::Negative { weight: -1, scale: 7, digits: vec![170, 1411, 8346, 0469, 2317, 3168, 7303, 7158, 8410, 5728] };
+        let pg = PgNumeric::Negative {
+            weight: -1,
+            scale: 7,
+            digits: vec![170, 1411, 8346, 0469, 2317, 3168, 7303, 7158, 8410, 5728],
+        };
         assert_eq!(pg_to_fpdec(&pg).unwrap_err(), ParseDecimalError::InternalOverflow);
     }
 
     #[test]
     fn fract_limit_exceeded() {
-        let pg = PgNumeric::Negative { weight: -1, scale: 20, digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4105] };
+        let pg = PgNumeric::Negative {
+            weight: -1,
+            scale: 20,
+            digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4105],
+        };
         assert_eq!(pg_to_fpdec(&pg).unwrap_err(), ParseDecimalError::FracDigitLimitExceeded);
     }
 
@@ -370,7 +375,11 @@ mod tests {
 
     #[test]
     fn largest_number_nofrac() {
-        let pg = PgNumeric::Negative { weight: 8, scale: 0, digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4105] };
+        let pg = PgNumeric::Negative {
+            weight: 8,
+            scale: 0,
+            digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4105],
+        };
         let fpdec = Dec!(-170141183460469231731687303715884105);
         assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
         assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);
@@ -378,7 +387,11 @@ mod tests {
 
     #[test]
     fn overflow_largest_number_nofrac() {
-        let pg = PgNumeric::Negative { weight: 8, scale: 0, digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4106] };
+        let pg = PgNumeric::Negative {
+            weight: 8,
+            scale: 0,
+            digits: vec![1701, 4118, 3460, 4692, 3173, 1687, 3037, 1588, 4106],
+        };
         let fpdec = Dec!(-170141183460469231731687303715884106);
         assert_eq!(pg_to_fpdec(&pg).unwrap(), fpdec);
         assert_eq!(fpdec_to_pg(&fpdec).unwrap(), pg);

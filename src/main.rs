@@ -147,12 +147,11 @@ mod tests {
     use actix_web::http::{Method, StatusCode};
     use actix_web::test as at;
     use diesel::prelude::*;
+    use fpdec::{Dec, Decimal};
     use serde::Serialize;
     use serde::de::{DeserializeOwned, StdError};
     use serde_json::json;
     use tokio::sync::OnceCell;
-    use fpdec::Dec;
-    use fpdec::Decimal;
 
     use super::*;
     use crate::env_vars::page_size;
@@ -477,11 +476,7 @@ mod tests {
             run_req(&app, Method::GET, "/api/source/T2SavingsAccount", t, None).await;
         assert_response_status_is_success(&res);
         let body = res.body.expect("expected body to be set on 200");
-        assert!(
-            body.amount.abs() < consts::EPSILON,
-            "source amount {} should be 0.0",
-            body.amount
-        );
+        assert!(body.amount.abs() < consts::EPSILON, "source amount {} should be 0.0", body.amount);
         assert!(body.archived, "source should be archived");
     }
 
@@ -846,7 +841,9 @@ mod tests {
         assert!(res.body.unwrap().iter().all(|e| e.category == "Entertainment"));
 
         // 12. Ensure that sources with deleted entries get their amounts returned
-        for (source, final_amount) in vec![("USDWallet", Dec!(880.0)), ("USDBankAccount", Dec!(965.0))] {
+        for (source, final_amount) in
+            vec![("USDWallet", Dec!(880.0)), ("USDBankAccount", Dec!(965.0))]
+        {
             let res: TestResponse<SourceResponse> =
                 run_req(&app, Method::GET, format!("/api/source/{source}").as_str(), t, None).await;
             assert_response_status_is_success(&res);
@@ -879,7 +876,20 @@ mod tests {
         // breakdown must be twelve zeros
         assert_eq!(
             stats.month_breakdown_in_fixed,
-            vec![Dec!(0.0), Dec!(0.0), Dec!(65.0), Dec!(0.0), Dec!(165.0), Dec!(0.0), Dec!(0.0), Dec!(0.0), Dec!(83.335), Dec!(0.0), Dec!(0.0), Dec!(0.0)]
+            vec![
+                Dec!(0.0),
+                Dec!(0.0),
+                Dec!(65.0),
+                Dec!(0.0),
+                Dec!(165.0),
+                Dec!(0.0),
+                Dec!(0.0),
+                Dec!(0.0),
+                Dec!(83.335),
+                Dec!(0.0),
+                Dec!(0.0),
+                Dec!(0.0)
+            ]
         );
         // current month (2025-08) sum = 0
         assert!(
