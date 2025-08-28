@@ -9,11 +9,11 @@ Written in Rust as a chance to not get rusty on Rust (pun intended).
 
 Current progress:
 - Schema - Done
-- CURD - Halfway done
-- Backend advanced operations - Not started
-- Functionality consolidation and backend integration tests - Not started
+- CURD - Done
+- Backend advanced operations - Done
+- Functionality consolidation and backend integration tests - Halfway done
 - Front end - Not started
 - Proper readme and documentation - Not started
 - Define codebase standards and adhere to them - Not started
 
-License: Modified MIT (one extra clause regarding informing the author in case of commercial use)
+License: Modified MIT (two extra clause regarding informing the author in case of commercial use, and not using software to train LLMs)

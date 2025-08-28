@@ -18,7 +18,6 @@ use actix_web::{App, HttpServer, web};
 use actix_web_httpauth::middleware::HttpAuthentication;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use handlers::login;
 
 use crate::consts::{Conn, Pool};
 
@@ -60,7 +59,7 @@ fn app(
     let app = App::new()
         .wrap(actix_web::middleware::Logger::new("%T %a %s %r %b").log_target("actix_web"))
         .app_data(web::Data::new(AppState { pool: pool.clone() }))
-        .route("/login", web::post().to(login))
+        .route("/login", web::post().to(handlers::login))
         .service(
             web::scope("/api")
                 .wrap(HttpAuthentication::bearer(authentication::jwt_validator_generator))
@@ -69,10 +68,7 @@ fn app(
                         .route("", web::post().to(handlers::create_currency))
                         // Parameters: page
                         .route("", web::get().to(handlers::get_currencies))
-                        // TODO(15): LOGIC: Also provide the monthly sums for the last 12 months, as
-                        //  well as that sum but normalized by conversion rates to fixed at the time
-                        //  of spending
-                        .route("/{name}/stats", web::get().to(handlers::unimplemented))
+                        .route("/{name}/stats", web::get().to(handlers::get_currency_stats))
                         .route("/{name}", web::get().to(handlers::get_currency_by_name))
                         .route("/{name}", web::post().to(handlers::update_currency))
                         .route("/{name}/archive", web::get().to(handlers::archive_currency))
@@ -111,8 +107,14 @@ fn app(
                         // Basic get-all handler, does not return any statistics
                         // Parameters: page
                         .route("/all", web::get().to(handlers::get_entries))
-                        // - sort (comma separated list of values that fall in
-                        //   amount|source|currency|category|date|created_at|entry_type)
+                        // Sort
+                        // - amount_asc, amount_desc
+                        // - date_asc, date_desc
+                        // - create_asc, create_desc
+                        // - defaults to date_asc
+                        // The rest of the fields (source|currency|category|entry_type|etc.)
+                        // have filtering but no sorting
+                        // Sort by source|currency|category|entry_type should be client-side.
                         // Returns the entries, their sum, their average per month, and their
                         // sum-per-category-per-month
                         .route("", web::get().to(handlers::find_entries))
@@ -912,5 +914,6 @@ mod tests {
         // TODO(40): TEST: Test newly implemented endpoints:
         //  - Get a currency's sources
         //  - Update entries by ids (bulk update entries)
+        //  Then run tests with coverage to check coverage on handlers, model, auth and numeric
     }
 }

@@ -17,11 +17,9 @@ use log::error;
 use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
 
-use crate::consts;
-use crate::consts::Conn;
+use crate::{consts, consts::Conn};
 use crate::env_vars::page_size;
 use crate::http::{ArrayQuery, internal};
-use crate::model::{EntryType, GetById, GetByNameAndUser};
 use crate::numeric::Numeric;
 #[allow(unused_imports)]
 use crate::{
@@ -32,7 +30,7 @@ use crate::{
         EntryResponse, GetNetAmount, HasSpecifier, NewCategory, NewCurrency, NewEntry, NewSource,
         Source, SourceResponse, StatefulTryFrom, StatefulTryFromError, UpdateCategory,
         UpdateCategoryRequest, UpdateCurrency, UpdateCurrencyRequest, UpdateEntry,
-        UpdateEntryRequest, UpdateSource, UpdateSourceRequest, User,
+        UpdateEntryRequest, UpdateSource, UpdateSourceRequest, User, EntryType, GetById, GetByNameAndUser
     },
 };
 
@@ -54,7 +52,7 @@ pub struct EmptyResponse {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CategoryStatsRequest {
+pub struct TimeBasedRequest {
     now: Option<String>,
 }
 
@@ -64,6 +62,15 @@ pub struct CategoryStatsResponse {
     pub monthly_average_in_fixed: Decimal,
     pub month_breakdown_in_fixed: Vec<Decimal>,
     pub current_month_in_fixed: Decimal,
+    pub year_largest_spends: Vec<EntryResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CurrencyStatsResponse {
+    pub year_sum: Decimal,
+    pub monthly_average: Decimal,
+    pub month_breakdown: Vec<Decimal>,
+    pub current_month: Decimal,
     pub year_largest_spends: Vec<EntryResponse>,
 }
 
@@ -524,7 +531,7 @@ get_by_name_handler!(get_source_by_name, sources, Source, SourceResponse);
 get_by_name_handler!(get_category_by_name, categories, Category, CategoryResponse);
 
 pub async fn get_category_stats(
-    web::Query(req): web::Query<CategoryStatsRequest>,
+    web::Query(req): web::Query<TimeBasedRequest>,
     path_name: web::Path<String>,
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
@@ -648,6 +655,136 @@ pub async fn get_category_stats(
         monthly_average_in_fixed: year_sum_in_fixed / Dec!(12.0),
         month_breakdown_in_fixed,
         current_month_in_fixed,
+        year_largest_spends,
+    };
+    HttpResponse::Ok().json(response)
+}
+
+pub async fn get_currency_stats(
+    web::Query(req): web::Query<TimeBasedRequest>,
+    path_name: web::Path<String>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use chrono::Datelike;
+    let now = if let Some(req_now) = req.now
+        && let Ok(req_now) = chrono::NaiveDate::parse_from_str(req_now.as_str(), "%Y-%m-%d")
+    {
+        req_now
+    } else {
+        chrono::Utc::now().date_naive()
+    };
+
+    let user = user.into_inner();
+    let app_state = app_state.into_inner();
+    let path_name = path_name.into_inner();
+    let fetched = match Currency::get_by_name_and_user(&path_name, &user, app_state.clone()).await {
+        Ok(f) => f,
+        Err(e) => {
+            if matches!(e, diesel::result::Error::NotFound) {
+                return HttpResponse::NotFound()
+                    .body(format!("{} not found", Currency::specifier()));
+            } else {
+                return internal(
+                    e,
+                    format!("E022: Failed to get {} by name", Currency::specifier()),
+                );
+            }
+        }
+    };
+    use crate::schema::entries::dsl::*;
+    let start_of_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+        .expect("Every month should have a start");
+    let year_ago = chrono::NaiveDate::from_ymd_opt(now.year() - 1, now.month(), 1)
+        .expect("Every month should have a start");
+    let found: Vec<Entry> = match entries
+        .filter(
+            currency_id
+                .eq(fetched.id)
+                .and(date.ge(chrono::NaiveDateTime::from(year_ago)))
+                .and(date.lt(chrono::NaiveDateTime::from(start_of_month))),
+        )
+        .order(date.asc())
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E027: Failed to get {} for category {}",
+                    Entry::specifier_plural(),
+                    &path_name
+                ),
+            );
+        }
+    };
+    let year_sum: Decimal = found.iter().map(|e| &e.amount).sum();
+    // Order months from same-month last year to the month before this one
+    let chunked_by_month =
+        found.iter().chunk_by(|item| (12u32 + item.date.month() - now.month()) % 12);
+    let mut month_breakdown = vec![Decimal::ZERO; 12];
+    chunked_by_month.into_iter().for_each(|(month, g)| {
+        month_breakdown[month as usize] = g.map(|e| &e.amount).sum()
+    });
+
+    let found: Vec<Entry> = match entries
+        .filter(
+            currency_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(start_of_month))),
+        )
+        .order(date.asc())
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E028: Failed to get {} for category {}",
+                    Entry::specifier_plural(),
+                    &path_name
+                ),
+            );
+        }
+    };
+    let current_month: Decimal = found.iter().map(|e| &e.amount).sum();
+
+    let found: Vec<Entry> = match entries
+        .filter(currency_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(year_ago))))
+        .order(amount_in_fixed.desc())
+        .limit(10)
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E027: Failed to get {} for category {}",
+                    Entry::specifier_plural(),
+                    &path_name
+                ),
+            );
+        }
+    };
+
+    let year_largest_spends: Vec<EntryResponse> = join_all(
+        found
+            .into_iter()
+            .map(async |e| EntryResponse::stateful_try_from(e, &user, app_state.clone()).await),
+    )
+    .await
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
+    let response = CurrencyStatsResponse {
+        year_sum,
+        monthly_average: year_sum / Dec!(12.0),
+        month_breakdown,
+        current_month,
         year_largest_spends,
     };
     HttpResponse::Ok().json(response)
@@ -1250,67 +1387,3 @@ pub async fn find_entries(
         Err(e) => e.into(),
     }
 }
-
-// TODO(20): DESIGN: Work on BE of filtering, searching, bulk editing, and displaying required for
-//  FE
-
-/*
-Front end should allow:
-
-# Entries functionality
-- Listing of entries
-- Filtering of entries based on source (including secondary source) / category / currency / entry type
-- Filtering of entries based on amount (gte / lte / eq)
-- Filtering of entries based on date (gte / lte / eq) (can quick select a month or a year)
-- Search of entries based on description
-- Multi-selecting entries, with select all that selects all entries in the search / filter.
-- Sort based on any field
-- Displays sum of selected entries (all entries if none selected)
-- Displays average per month of selected entries
-- Displays sum per category per month of selected entries
-- Bulk editing of selected entries (can change category / description / currency / source / secondary source / entry type)
-- Editing of individual entries (allows changing the above, and conversion rate, date and amount)
-- Archival / deletion of entries
-- Creation of new entries
-
-# Categories functionality
-- Monthly sum of entries for this category
-- TODO(80): DESIGN: decide the rest of categories functionality
-
-# Currencies functionality
-- Change display currency (for all of the above) - defaults to the fixed currency of the user
-- TODO(80): DESIGN: decide the rest of currencies functionality
-
-# Sources functionality
-- TODO(80): DESIGN: decide the rest of sources functionality
-- FE Currency should display: The balance exists in the following sources: <_>
-
-# General front-end
-- Tables
-- Printing
-
-TODO(75): STRUCTURE: at the very end: Look into diesel async, which would only require adding .await after each cpool() execute / load.
-Look into the 3 other pooling crates other than r2d2.
-
-TODO(70): EXTRA: Automatic price fetching from an online API
-TODO(70): EXTRA: Automatic tagging of entries:
-  - allow a box for amount + currency (prefix / suffix) and a dropdown for currency - locked if typed inside the box
-  - box placeholder should have currency as prefix
-  - Third input is for description, with an AI button beside it, that when tapped will try to fill all the remaining inputs from AI
-  - This input should have autocomplete from existing ones (combo box like)
-  Automatically tag:
-  - entry type - deduce from description
-  - category - deduce from description
-  - source id - deduce from description
-  - secondary source id - deduce from description
-  - date if specified in description, otherwise current date
-  - description (updated to no longer have category, date, and entry type),
-  Deduction from description works by trying to match to an existing description in database (by strict matching, or asking an LLM),
-  and if not, by asking an LLM to come up with something of its own
-*/
-
-/*
-todos: three 5s, one 9, one 10, one 12, six 15s, one 20, two 30s, one 40, two 70s, one 75, three 80s
-after those todos, API will be pretty much done
-I can start work on front-end, and then v1 of thi
-*/

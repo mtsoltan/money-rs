@@ -6,22 +6,21 @@ use diesel::{
     Associations, BelongingToDsl, BoolExpressionMethods, ExpressionMethods, Identifiable,
     Insertable, PgTextExpressionMethods, QueryDsl, Queryable, Selectable,
 };
-use fpdec::Decimal;
 use futures::future::join_all;
 use log::warn;
 use serde::{Deserialize, Serialize};
 
-// Needed by macros
+// Needed by macros, keep even if "unused"
 #[rustfmt::skip]
 use {
+    fpdec::Decimal, // inner_macros relies on this type
     crate::schema::*,
     crate::schema::sql_types::EntryT, // Used by `diesel_derive_enum::DbEnum`
     crate::AppState,
+    crate::numeric::Numeric, // inner_macros relies on this type
     inner_macros::Entity // The `inner_macros::Entity` derivable macro itself
 };
 use diesel_async::RunQueryDsl as _;
-
-use crate::numeric::Numeric;
 
 #[derive(Debug, PartialEq, Clone, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
 #[ExistingTypePath = "EntryT"]
@@ -1030,6 +1029,8 @@ impl Entry {
 
         if let Some(sort) = &query_params.sort {
             match sort.as_str() {
+                "create_asc" => query = query.order((created_at.asc(), id.asc())),
+                "create_desc" => query = query.order((created_at.asc(), id.asc())),
                 "amount_asc" => query = query.order((amount.asc(), created_at.asc(), id.asc())),
                 "amount_desc" => query = query.order((amount.desc(), created_at.asc(), id.asc())),
                 "date_asc" => query = query.order((date.asc(), created_at.asc(), id.asc())),
