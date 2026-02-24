@@ -7,13 +7,12 @@ extern crate core;
 
 mod authentication;
 mod consts;
+mod entity;
 mod env_vars;
 mod handlers;
 mod http;
-mod model;
-mod numeric;
-mod schema;
 
+use actix_files::{Files, NamedFile};
 use actix_web::{App, HttpServer, web};
 use actix_web_httpauth::middleware::HttpAuthentication;
 use diesel_async::AsyncPgConnection;
@@ -28,7 +27,7 @@ pub struct AppState {
 
 impl AppState {
     pub async fn cpool(&self) -> Conn {
-        self.pool.clone().get().await.expect("Pool should be initialized")
+        self.pool.clone().get().await.expect("X003: Pool should be initialized")
     }
 }
 
@@ -41,7 +40,7 @@ async fn main() -> std::io::Result<()> {
 fn pool() -> Pool {
     env_vars::init();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(env_vars::database_url());
-    Pool::builder(manager).build().expect("Failed to create pool")
+    Pool::builder(manager).build().expect("X005: Failed to create pool")
 }
 
 fn app(
@@ -124,6 +123,16 @@ fn app(
                         .route("", web::delete().to(handlers::delete_entries))
                         .route("/archive", web::get().to(handlers::archive_entries)),
                 ),
+        )
+        .service(
+            web::scope("/app")
+                // Serve the built assets (WASM, JS, CSS). `""` mounts inside the scope prefix.
+                .service(
+                    web::scope("/static")
+                        .service(Files::new("", env_vars::app_dist_dir()).index_file("index.html")),
+                )
+                // SPA fallback for deep links under /app/*
+                .default_service(web::get().to(spa_index)),
         );
 
     #[cfg(any(test, feature = "create_user"))]
@@ -133,6 +142,12 @@ fn app(
     let app = app.route("/user/{username}", web::delete().to(handlers::delete_user));
 
     app
+}
+
+async fn spa_index() -> Result<NamedFile, actix_web::Error> {
+    NamedFile::open_async(dbg!(std::path::Path::join(env_vars::app_dist_dir(), "index.html")))
+        .await
+        .map_err(|e| actix_web::error::ErrorNotFound(format!("index.html not found: {e}")))
 }
 
 // Tests can run in parallel, do not duplicate source, currency, or category names.
@@ -150,6 +165,10 @@ mod tests {
     use actix_web::test as at;
     use diesel::prelude::*;
     use fpdec::{Dec, Decimal};
+    use model::entity::{
+        CategoryResponse, CategoryStatsResponse, CurrencyResponse, EmptyResponse, EntryQuery,
+        EntryResponse, FindEntriesResponse, LoginResponse, SourceResponse,
+    };
     use serde::Serialize;
     use serde::de::{DeserializeOwned, StdError};
     use serde_json::json;
@@ -157,12 +176,6 @@ mod tests {
 
     use super::*;
     use crate::env_vars::page_size;
-    use crate::handlers::{
-        CategoryStatsResponse, EmptyResponse, FindEntriesResponse, LoginResponse,
-    };
-    use crate::model::{
-        CategoryResponse, CurrencyResponse, EntryQuery, EntryResponse, SourceResponse,
-    };
 
     static TEST_USERNAME: &str = "root";
     static TEST_PASSWORD: &str = "root";
@@ -244,7 +257,7 @@ mod tests {
                     TestResponse {
                         status_code,
                         body_string: serde_json::to_string(&res_struct).expect(
-                            "Serializing returned code 200 json body should always succeed",
+                            "XT: Serializing returned code 200 json body should always succeed",
                         ),
                         body: Some(res_struct),
                     }
@@ -302,7 +315,7 @@ mod tests {
             .await;
             assert_response_status_is_success(&res);
 
-            res.body.expect("expected body to be set on 200").token
+            res.body.expect("XT: expected body to be set on 200").token
         }
 
         static TOKEN: OnceCell<String> = OnceCell::const_new();
@@ -317,10 +330,10 @@ mod tests {
                 + diesel::query_builder::QueryId
                 + Send,
     {
-        let mut conn = pool.get().await.expect("Failed to get database connection");
+        let mut conn = pool.get().await.expect("XT: Failed to get database connection");
         diesel_async::RunQueryDsl::execute(diesel::delete(q), &mut conn)
             .await
-            .expect("Failed to run the delete query you specified");
+            .expect("XT: Failed to run the delete query you specified");
     }
 
     #[actix_web::test]
@@ -330,7 +343,7 @@ mod tests {
     async fn test_currency_lifecycle() {
         // Cleanup
         {
-            use crate::schema::currencies::dsl::*;
+            use model::schema::currencies::dsl::*;
             delete_direct(&pool(), currencies.filter(name.eq("T1EUR"))).await;
         }
 
@@ -353,7 +366,7 @@ mod tests {
         let res: TestResponse<CurrencyResponse> =
             run_req(&app, Method::GET, "/api/currency/T1EUR", t, None).await;
         assert_response_status_is_success(&res);
-        let name = res.body.expect("expected body to be set on 200").name;
+        let name = res.body.expect("XT: expected body to be set on 200").name;
         assert_eq!(name, "T1EUR", "currency name {name} should be T1EUR");
 
         // Update currency
@@ -376,7 +389,7 @@ mod tests {
         let res: TestResponse<CurrencyResponse> =
             run_req(&app, Method::GET, "/api/currency/T1EUR", t, None).await;
         assert_response_status_is_success(&res);
-        let body = res.body.expect("expected body to be set on 200");
+        let body = res.body.expect("XT: expected body to be set on 200");
         assert!(
             (body.rate_to_fixed - Dec!(1.06)).abs() < consts::EPSILON,
             "currency rate {} should be 1.06",
@@ -400,11 +413,11 @@ mod tests {
     async fn test_source_lifecycle() {
         // Cleanup
         {
-            use crate::schema::sources::dsl::*;
+            use model::schema::sources::dsl::*;
             delete_direct(&pool(), sources.filter(name.eq("T2SavingsAccount"))).await;
         }
         {
-            use crate::schema::currencies::dsl::*;
+            use model::schema::currencies::dsl::*;
             delete_direct(&pool(), currencies.filter(name.eq("T2GBP"))).await;
         }
 
@@ -438,7 +451,7 @@ mod tests {
         let res: TestResponse<SourceResponse> =
             run_req(&app, Method::GET, "/api/source/T2SavingsAccount", t, None).await;
         assert_response_status_is_success(&res);
-        let name = res.body.expect("expected body to be set on 200").name;
+        let name = res.body.expect("XT: expected body to be set on 200").name;
         assert_eq!(name, "T2SavingsAccount", "source name should be 'T2SavingsAccount'");
 
         // Update a source
@@ -477,7 +490,7 @@ mod tests {
         let res: TestResponse<SourceResponse> =
             run_req(&app, Method::GET, "/api/source/T2SavingsAccount", t, None).await;
         assert_response_status_is_success(&res);
-        let body = res.body.expect("expected body to be set on 200");
+        let body = res.body.expect("XT: expected body to be set on 200");
         assert!(body.amount.abs() < consts::EPSILON, "source amount {} should be 0.0", body.amount);
         assert!(body.archived, "source should be archived");
     }
@@ -486,7 +499,7 @@ mod tests {
     async fn test_category_lifecycle() {
         // Cleanup
         {
-            use crate::schema::categories::dsl::*;
+            use model::schema::categories::dsl::*;
             delete_direct(&pool(), categories.filter(name.eq("T3RentAndBills"))).await;
             delete_direct(&pool(), categories.filter(name.eq("T3RecurringExpenses"))).await;
         }
@@ -510,7 +523,7 @@ mod tests {
         let res: TestResponse<CategoryResponse> =
             run_req(&app, Method::GET, "/api/category/T3RentAndBills", t, None).await;
         assert_response_status_is_success(&res);
-        let name = res.body.expect("expected body to be set on 200").name;
+        let name = res.body.expect("XT: expected body to be set on 200").name;
         assert_eq!(name, "T3RentAndBills", "category name should be 'T3RentAndBills'");
 
         // Update category name
@@ -533,7 +546,7 @@ mod tests {
         let res: TestResponse<CategoryResponse> =
             run_req(&app, Method::GET, "/api/category/T3RecurringExpenses", t, None).await;
         assert_response_status_is_success(&res);
-        let body = res.body.expect("expected body to be set on 200");
+        let body = res.body.expect("XT: expected body to be set on 200");
         assert_eq!(
             body.name, "T3RecurringExpenses",
             "category name should be 'T3RecurringExpenses'"
@@ -545,10 +558,10 @@ mod tests {
     async fn test_entries_lifecycle() {
         // 0. Cleanup: Delete currencies, categories, sources, and entries if they already exist
         {
-            use crate::schema::categories::dsl::*;
-            use crate::schema::currencies::dsl::*;
-            use crate::schema::entries::dsl::*;
-            use crate::schema::sources::dsl::*;
+            use model::schema::categories::dsl::*;
+            use model::schema::currencies::dsl::*;
+            use model::schema::entries::dsl::*;
+            use model::schema::sources::dsl::*;
             delete_direct(&pool(), entries).await;
             delete_direct(&pool(), categories).await;
             delete_direct(&pool(), sources).await;
@@ -730,7 +743,7 @@ mod tests {
             let res: TestResponse<SourceResponse> =
                 run_req(&app, Method::GET, format!("/api/source/{source}").as_str(), t, None).await;
             assert_response_status_is_success(&res);
-            let amount = res.body.expect("expected body to be set on 200").amount;
+            let amount = res.body.expect("XT: expected body to be set on 200").amount;
             assert!(
                 (amount - final_amount).abs() < consts::EPSILON,
                 "{source}: expected final_amount to be {final_amount} found {amount}"
@@ -741,7 +754,7 @@ mod tests {
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/entry/all", t, None).await;
         assert_response_status_is_success(&res);
-        let all_entries = res.body.expect("Expected entries in response");
+        let all_entries = res.body.expect("XT: Expected entries in response");
         assert_eq!(all_entries.len(), 22, "Expected 22 entries initially");
 
         // 7. Use find entries with different filters and verify results
@@ -762,7 +775,7 @@ mod tests {
             filters.into_iter().map(|o| (serde_qs::to_string::<EntryQuery>(&o.0), o.1));
 
         for (filter, expected_count) in filters_qs {
-            let filter = filter.expect("Filter should always succeed in serializing");
+            let filter = filter.expect("XT: Filter should always succeed in serializing");
             let res: TestResponse<FindEntriesResponse> =
                 run_req(&app, Method::GET, format!("/api/entry?{filter}").as_str(), t, None).await;
             if expected_count < 0 {
@@ -771,7 +784,7 @@ mod tests {
             }
 
             assert_response_status_is_success(&res);
-            let filtered_entries = res.body.expect("Expected filtered entries");
+            let filtered_entries = res.body.expect("XT: Expected filtered entries");
             // dbg!(json!(filtered_entries));
             assert_eq!(
                 filtered_entries.entries.len(),
@@ -810,15 +823,15 @@ mod tests {
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/entry/all", t, None).await;
         assert_response_status_is_success(&res);
-        let body = res.body.expect("Expected entries in response");
-        assert_eq!(body.len(), 20, "Expected 20 entries after deletion");
+        let body = res.body.expect("XT: Expected entries in response");
+        assert_eq!(body.len(), 20, "XT: Expected 20 entries after deletion");
         assert_eq!(body.iter().filter(|o| o.archived).count(), 2, "Expected 2 archived entries");
 
         // 10. Assert pagination works
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/entry/all?page=1", t, None).await;
         assert_response_status_is_success(&res);
-        let body = res.body.expect("Expected entries in response");
+        let body = res.body.expect("XT: Expected entries in response");
         assert_eq!(
             body.len() as u32,
             page_size(),
@@ -831,14 +844,17 @@ mod tests {
             run_req(&app, Method::GET, "/api/currency/JPY/entries", t, None).await;
         assert_response_status_is_success(&res);
         assert!(
-            res.body.expect("Expected entries in response").iter().all(|e| e.currency == "JPY")
+            res.body.expect("XT: Expected entries in response").iter().all(|e| e.currency == "JPY")
         );
 
         let res: TestResponse<Vec<EntryResponse>> =
             run_req(&app, Method::GET, "/api/source/JPYWallet/entries", t, None).await;
         assert_response_status_is_success(&res);
         assert!(
-            res.body.expect("Expected entries in response").iter().all(|e| e.source == "JPYWallet")
+            res.body
+                .expect("XT: Expected entries in response")
+                .iter()
+                .all(|e| e.source == "JPYWallet")
         );
 
         let res: TestResponse<Vec<EntryResponse>> =
@@ -846,7 +862,7 @@ mod tests {
         assert_response_status_is_success(&res);
         assert!(
             res.body
-                .expect("Expected entries in response")
+                .expect("XT: Expected entries in response")
                 .iter()
                 .all(|e| e.category == "Entertainment")
         );
@@ -858,7 +874,7 @@ mod tests {
             let res: TestResponse<SourceResponse> =
                 run_req(&app, Method::GET, format!("/api/source/{source}").as_str(), t, None).await;
             assert_response_status_is_success(&res);
-            let amount = res.body.expect("expected body to be set on 200").amount;
+            let amount = res.body.expect("XT: expected body to be set on 200").amount;
             assert!(
                 (amount - final_amount).abs() < consts::EPSILON,
                 "{source}: expected final_amount to be {final_amount} found {amount}"
@@ -870,7 +886,7 @@ mod tests {
             run_req(&app, Method::GET, "/api/category/Entertainment/stats?now=2023-12-05", t, None)
                 .await;
         assert_response_status_is_success(&res);
-        let stats = res.body.expect("Expected CategoryStatsResponse");
+        let stats = res.body.expect("XT: Expected CategoryStatsResponse");
 
         // sum over past 12 months (2024-08 through 2025-07) is 0
         assert!(

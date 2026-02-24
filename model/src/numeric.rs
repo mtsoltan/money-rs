@@ -2,19 +2,24 @@ use std::fmt;
 use std::ops::{Add, Div, Mul, Sub};
 use std::str::FromStr;
 
-use diesel::data_types::PgNumeric;
-use diesel::deserialize::FromSql;
-use diesel::pg::{Pg, PgValue};
-use diesel::serialize::ToSql;
-use diesel::{AsExpression, FromSqlRow, sql_types};
+#[cfg(feature = "backend")]
+use diesel::{
+    data_types::PgNumeric,
+    deserialize::FromSql,
+    pg::{Pg, PgValue},
+    serialize::ToSql,
+    AsExpression, FromSqlRow, sql_types,
+};
+
 use fpdec::{Decimal, ParseDecimalError};
 use serde::de::{Error, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::consts;
+pub const MAX_N_FRAC_DIGITS: u8 = 18;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, AsExpression, FromSqlRow)]
-#[diesel(sql_type = sql_types::Numeric)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "backend", derive(AsExpression, FromSqlRow))]
+#[cfg_attr(feature = "backend", diesel(sql_type = sql_types::Numeric))]
 pub struct Numeric(Decimal);
 
 impl Numeric {
@@ -22,12 +27,21 @@ impl Numeric {
     pub fn dec(&self) -> Decimal { self.0 }
 }
 
+#[cfg(feature = "backend")]
 impl From<PgNumeric> for Numeric {
     // TODO(60): Actual error handling here for the case in which a maliciously crafted numeric is
     //  manually added to the database somehow, and fails to convert to fpdec due to being large /
     //  having high precision, and fails digits.len() check or digits_after_decimal_dot check.
     fn from(value: PgNumeric) -> Self {
-        Numeric(pg_to_fpdec(&value).expect("This conversion should almost always succeed"))
+        Numeric(pg_to_fpdec(&value).expect("X006: This conversion should almost always succeed"))
+    }
+}
+
+impl TryFrom<&str> for Numeric {
+    type Error = ParseDecimalError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match Decimal::from_str(value) {
+            Ok(d) => Ok(Numeric::from(d)), Err(e) => Err(e) }
     }
 }
 
@@ -43,12 +57,14 @@ impl Into<Decimal> for &Numeric {
     fn into(self) -> Decimal { self.0 }
 }
 
+#[cfg(feature = "backend")]
 impl FromSql<sql_types::Numeric, Pg> for Numeric {
     fn from_sql(bytes: PgValue<'_>) -> diesel::deserialize::Result<Self> {
         PgNumeric::from_sql(bytes).map(|i| i.into())
     }
 }
 
+#[cfg(feature = "backend")]
 fn fpdec_to_pg(decimal: &Decimal) -> Result<PgNumeric, ParseDecimalError> {
     let (mut integer, scale) = (decimal.coefficient(), decimal.n_frac_digits());
     if integer == 0 {
@@ -79,9 +95,9 @@ fn fpdec_to_pg(decimal: &Decimal) -> Result<PgNumeric, ParseDecimalError> {
     // Original implementation used to subtract an extra one,
     // which means having a digit left of the dot would yield 0 and not would yield -1.
     let weight = i16::try_from(digits.len())
-        .expect("Max digit number is expected to fit into 16 bit")
+        .expect("X007: Max digit number is expected to fit into 16 bit")
         - i16::try_from(digits_after_decimal)
-            .expect("Max digit number is expected to fit into 16 bit")
+            .expect("X007: Max digit number is expected to fit into 16 bit")
         - 1;
 
     let unnecessary_zeroes = digits.iter().rev().take_while(|i| **i == 0).count();
@@ -95,6 +111,7 @@ fn fpdec_to_pg(decimal: &Decimal) -> Result<PgNumeric, ParseDecimalError> {
     })
 }
 
+#[cfg(feature = "backend")]
 impl ToSql<sql_types::Numeric, Pg> for Numeric {
     fn to_sql<'b>(
         &self,
@@ -107,7 +124,7 @@ impl ToSql<sql_types::Numeric, Pg> for Numeric {
         //  by 10 multiple times to overflow fpdec::Decimal's capability before it's turned into
         //  PgNumeric, and fails checked_mul.
         let pg_numeric =
-            fpdec_to_pg(&self.0).expect("This conversion should almost always succeed");
+            fpdec_to_pg(&self.0).expect("X009: This conversion should almost always succeed");
 
         let sign = match pg_numeric {
             PgNumeric::Positive { .. } => 0,
@@ -231,6 +248,7 @@ impl<'a> std::iter::Sum<&'a Numeric> for Decimal {
     }
 }
 
+#[cfg(feature = "backend")]
 pub fn pg_to_fpdec(pgn: &PgNumeric) -> Result<Decimal, ParseDecimalError> {
     let (sign, _, weight, digits) = match pgn {
         PgNumeric::NaN => return Err(ParseDecimalError::Invalid),
@@ -273,7 +291,7 @@ pub fn pg_to_fpdec(pgn: &PgNumeric) -> Result<Decimal, ParseDecimalError> {
         }
     }
 
-    if digits_after_decimal_dot as u8 > consts::MAX_N_FRAC_DIGITS {
+    if digits_after_decimal_dot as u8 > MAX_N_FRAC_DIGITS {
         return Err(ParseDecimalError::FracDigitLimitExceeded);
     }
 
@@ -281,6 +299,7 @@ pub fn pg_to_fpdec(pgn: &PgNumeric) -> Result<Decimal, ParseDecimalError> {
     Ok(result)
 }
 
+#[cfg(feature = "backend")]
 #[cfg(test)]
 mod tests {
     use diesel::data_types::PgNumeric;

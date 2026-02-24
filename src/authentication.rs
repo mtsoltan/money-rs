@@ -7,11 +7,11 @@ use actix_web_httpauth::extractors::bearer::BearerAuth;
 use diesel::QueryDsl;
 use diesel_async::RunQueryDsl as _;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
+use model::entity::User;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::env_vars::jwt_secret;
-use crate::model::User;
 
 #[derive(thiserror::Error, Debug)]
 enum AuthenticationError {
@@ -33,11 +33,11 @@ pub fn generate(user_id: i32) -> String {
 
     let claims =
         Rfc7519Claims::try_from(LoginClaims { user_id, expires_at: expires, created_at: created })
-            .expect("System time before unix epoch");
+            .expect("X002: System time before unix epoch");
 
     let header = Header::default();
     jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(jwt_secret().as_ref()))
-        .expect("Encoding JWT token failed")
+        .expect("X002: Encoding JWT token failed")
 }
 
 pub fn decode(token: &str) -> Result<Rfc7519Claims, jsonwebtoken::errors::Error> {
@@ -89,7 +89,7 @@ pub async fn jwt_validator_generator(
     req: ServiceRequest,
     credentials: BearerAuth,
 ) -> Result<ServiceRequest, (Error, ServiceRequest)> {
-    use crate::schema::users::dsl::*;
+    use model::schema::users::dsl::*;
     match decode(credentials.token()) {
         Ok(claims) => {
             let login_claims = LoginClaims::from(claims);
@@ -102,7 +102,7 @@ pub async fn jwt_validator_generator(
                 .first(
                     &mut req
                         .app_data::<actix_web::web::Data<AppState>>()
-                        .expect("AppState should be defined")
+                        .expect("X004: AppState should be defined")
                         .cpool()
                         .await,
                 )

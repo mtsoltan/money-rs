@@ -1,3 +1,20 @@
+# Immediate TODO
+
+1. Verify back navigation
+2. Fix state (part of history, making it thread local), verify
+  - Make sure the `static` lifetime requirement for push to history is met
+3. Fix state storage and retrieval in local storage, verify
+3. Link state with query parameter, verify
+4. Use the route object, introduce middleware handling and renderers
+5. Introduce authentication middleware, modify router to handle it
+6. Switch that rendering to respect state
+7. Introduce timestamp-based fetches in backend as new endpoints
+8. Use those endpoints in front-end to reconcile thread local data
+9. Finish the 30 to dos in state.rs
+10. Implement entries and setup from their yew code
+11. Finish the 30 to dos in entries.rs and setup.rs
+12. Look at the 40 to dos, work from there
+
 Front end should allow:
 
 # Entries functionality
@@ -63,6 +80,8 @@ TODO(70): EXTRA: Automatic tagging of entries:
   Deduction from description works by trying to match to an existing description in database (by strict matching, or asking an LLM),
   and if not, by asking an LLM to come up with something of its own
 
+
+TODO(70): Introduce reconcilation logic for multiple offline edits from different devices same as obsidian
 
 todos: 8 todos: one 40, two 60s, 2 70s are left for the backend, then three 80s between the backend and the front-end.
 I can start work on front-end, and then v1 of this

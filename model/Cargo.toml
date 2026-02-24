@@ -1,0 +1,18 @@
+[package]
+name = "model"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4.41", features = ["serde"] }
+diesel = { version = "2.3.2", features = ["postgres", "r2d2", "chrono"], optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+diesel-derive-enum = { version = "2.1.0", features = ["postgres"], optional = true  }
+fpdec = { version = "0.11.0", features = ["std", "serde-as-str", "num-traits"]}
+inner-macros = { path = "../inner_macros", default-features = false }
+byteorder = "1.5.0"
+
+[features]
+default = ["backend"]
+backend = ["dep:diesel", "dep:diesel-derive-enum", "inner-macros/backend"]

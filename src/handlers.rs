@@ -14,85 +14,29 @@ use fpdec::{Dec, Decimal};
 use futures::future::join_all;
 use itertools::Itertools;
 use log::error;
+#[cfg(any(test, feature = "create_user"))]
+use model::entity::CreateUserRequest;
+use model::entity::{
+    Category, CategoryResponse, CategoryStatsResponse, CountResponse, CreateCategoryRequest,
+    CreateCurrencyRequest, CreateEntryRequest, CreateResponse, CreateSourceRequest, Currency,
+    CurrencyResponse, CurrencyStatsResponse, EmptyResponse, Entry, EntryQuery, EntryResponse,
+    EntryType, FindEntriesResponse, HasSpecifier, LoginRequest, LoginResponse, NewCategory,
+    NewCurrency, NewEntry, NewSource, SimplePaginatedRequest, Source, SourceEntriesRequest,
+    SourceResponse, TimeBasedRequest, UpdateCategory, UpdateCategoryRequest, UpdateCurrency,
+    UpdateCurrencyRequest, UpdateEntry, UpdateEntryRequest, UpdateSource, UpdateSourceRequest,
+    User,
+};
+use model::numeric::Numeric;
 use password_hash::PasswordHash;
 use serde::{Deserialize, Serialize};
 
-use crate::{consts, consts::Conn};
+use crate::consts::Conn;
+use crate::entity::{
+    FindByFilter, GetById, GetByNameAndUser, GetNetAmount, StatefulTryFrom, StatefulTryFromError,
+};
 use crate::env_vars::page_size;
 use crate::http::{ArrayQuery, internal};
-use crate::numeric::Numeric;
-#[allow(unused_imports)]
-use crate::{
-    AppState,
-    model::{
-        Category, CategoryResponse, CreateCategoryRequest, CreateCurrencyRequest,
-        CreateEntryRequest, CreateSourceRequest, Currency, CurrencyResponse, Entry, EntryQuery,
-        EntryResponse, GetNetAmount, HasSpecifier, NewCategory, NewCurrency, NewEntry, NewSource,
-        Source, SourceResponse, StatefulTryFrom, StatefulTryFromError, UpdateCategory,
-        UpdateCategoryRequest, UpdateCurrency, UpdateCurrencyRequest, UpdateEntry,
-        UpdateEntryRequest, UpdateSource, UpdateSourceRequest, User, EntryType, GetById, GetByNameAndUser
-    },
-};
-
-// We cannot skip serialization in any of the fields in the response, as in the tests,
-// we will need to reconstruct the response from the JSON string to reason about it,
-// to not have to write code that uses maps.
-//
-// The exception is CreateResponse, which serializes as empty response.
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CreateResponse {
-    #[allow(dead_code)]
-    #[serde(skip_serializing)]
-    pub id: i32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EmptyResponse {}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TimeBasedRequest {
-    now: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CategoryStatsResponse {
-    pub year_sum_in_fixed: Decimal,
-    pub monthly_average_in_fixed: Decimal,
-    pub month_breakdown_in_fixed: Vec<Decimal>,
-    pub current_month_in_fixed: Decimal,
-    pub year_largest_spends: Vec<EntryResponse>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CurrencyStatsResponse {
-    pub year_sum: Decimal,
-    pub monthly_average: Decimal,
-    pub month_breakdown: Vec<Decimal>,
-    pub current_month: Decimal,
-    pub year_largest_spends: Vec<EntryResponse>,
-}
-
-/// Used only when performing group-operation on entries (not entities).
-/// Examples are deleting and archiving and block-updating entries.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CountResponse {
-    pub count: usize,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimplePaginatedRequest {
-    page: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceEntriesRequest {
-    page: Option<u32>,
-    primary_only: Option<bool>,
-}
+use crate::{AppState, consts};
 
 #[cfg(any(test, feature = "create_user"))]
 #[derive(thiserror::Error, Debug)]
@@ -108,28 +52,8 @@ impl From<password_hash::Error> for ExternalServiceError {
     fn from(value: password_hash::Error) -> Self { Self::HashError(value) }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LoginRequest {
-    username: String,
-    password: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LoginResponse {
-    pub token: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FindEntriesResponse {
-    pub sum_per_month: HashMap<String, Decimal>,
-    pub monthly_average: Decimal,
-    pub sum_per_category_per_month: HashMap<String, Decimal>,
-    pub entries: Vec<EntryResponse>,
-}
-
 pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>) -> HttpResponse {
-    use crate::schema::users::dsl::*;
+    use model::schema::users::dsl::*;
     let mut err = 0;
 
     let mut items = users
@@ -177,34 +101,24 @@ pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>
 }
 
 #[cfg(any(test, feature = "create_user"))]
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateUserRequest {
-    username: String,
-    password: String,
-    currency: String,
-}
-
-#[cfg(any(test, feature = "create_user"))]
 pub async fn create_user(
     mut data: web::Json<CreateUserRequest>,
     app_state: web::Data<AppState>,
 ) -> HttpResponse {
     use base64::Engine as _;
+    use model::entity::NewUser;
     use password_hash::Salt;
     use rand::RngCore as _;
-
-    use crate::model::NewUser;
     let created_user: Result<User, ExternalServiceError> = try {
-        use crate::schema::currencies::dsl::*;
-        use crate::schema::users::dsl::*;
+        use model::schema::currencies::dsl::*;
+        use model::schema::users::dsl::*;
         // Salt::RECOMMENDED_LENGTH would fail because of equal signs.
         // See https://docs.rs/password-hash/latest/src/password_hash/salt.rs.html#122
         let mut bytes: [u8; 12] = [0; 12];
         rand::rng().fill_bytes(&mut bytes);
         let base64_string = base64::engine::general_purpose::STANDARD.encode(bytes);
         let generated_salt =
-            Salt::from_b64(base64_string.as_str()).expect("Salt construction should work");
+            Salt::from_b64(base64_string.as_str()).expect("X008: Salt construction should work");
         let hash = PasswordHash::generate(Pbkdf2, data.password.as_bytes(), generated_salt)?;
 
         let user = insert_into(users)
@@ -237,7 +151,7 @@ pub async fn delete_user(
     path_username: web::Path<String>,
     app_state: web::Data<AppState>,
 ) -> HttpResponse {
-    use crate::schema::users::dsl::*;
+    use model::schema::users::dsl::*;
     let path_username = path_username.into_inner();
     let deleted_count = diesel::delete(users.filter(username.eq(path_username)))
         .execute(&mut app_state.cpool().await)
@@ -268,7 +182,7 @@ macro_rules! create_handler {
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
-            use crate::schema::$tb_name::dsl::*;
+            use model::schema::$tb_name::dsl::*;
             let creatable = <$new as StatefulTryFrom<$req>>::stateful_try_from(
                 data.into_inner(),
                 &user.into_inner(),
@@ -314,7 +228,7 @@ pub async fn create_entry(
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
-    use crate::schema::entries::dsl;
+    use model::schema::entries::dsl;
     let app_state = app_state.into_inner();
     let creatable = <NewEntry as StatefulTryFrom<CreateEntryRequest>>::stateful_try_from(
         data.into_inner(),
@@ -464,23 +378,23 @@ get_all_handler!(
     get_currencies,
     Currency,
     CurrencyResponse,
-    crate::schema::currencies::dsl::id.asc()
+    model::schema::currencies::dsl::id.asc()
 );
-get_all_handler!(get_sources, Source, SourceResponse, crate::schema::sources::dsl::name.asc());
+get_all_handler!(get_sources, Source, SourceResponse, model::schema::sources::dsl::name.asc());
 get_all_handler!(
     get_categories,
     Category,
     CategoryResponse,
-    crate::schema::categories::dsl::name.asc()
+    model::schema::categories::dsl::name.asc()
 );
 get_all_handler!(
     get_entries,
     Entry,
     EntryResponse,
     (
-        crate::schema::entries::dsl::date.asc(),
-        crate::schema::entries::dsl::created_at.asc(),
-        crate::schema::entries::dsl::id.asc()
+        model::schema::entries::dsl::date.asc(),
+        model::schema::entries::dsl::created_at.asc(),
+        model::schema::entries::dsl::id.asc()
     )
 );
 
@@ -551,22 +465,18 @@ pub async fn get_category_stats(
     let fetched = match Category::get_by_name_and_user(&path_name, &user, app_state.clone()).await {
         Ok(f) => f,
         Err(e) => {
-            if matches!(e, diesel::result::Error::NotFound) {
-                return HttpResponse::NotFound()
-                    .body(format!("{} not found", Category::specifier()));
+            return if matches!(e, diesel::result::Error::NotFound) {
+                HttpResponse::NotFound().body(format!("{} not found", Category::specifier()))
             } else {
-                return internal(
-                    e,
-                    format!("E022: Failed to get {} by name", Category::specifier()),
-                );
-            }
+                internal(e, format!("E022: Failed to get {} by name", Category::specifier()))
+            };
         }
     };
-    use crate::schema::entries::dsl::*;
+    use model::schema::entries::dsl::*;
     let start_of_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
-        .expect("Every month should have a start");
+        .expect("X011: Every month should have a start");
     let year_ago = chrono::NaiveDate::from_ymd_opt(now.year() - 1, now.month(), 1)
-        .expect("Every month should have a start");
+        .expect("X011: Every month should have a start");
     let found: Vec<Entry> = match entries
         .filter(
             category_id
@@ -583,8 +493,9 @@ pub async fn get_category_stats(
             return internal(
                 e,
                 format!(
-                    "E027: Failed to get {} for category {}",
+                    "E027: Failed to get {} for {} {}",
                     Entry::specifier_plural(),
+                    Category::specifier(),
                     &path_name
                 ),
             );
@@ -612,8 +523,9 @@ pub async fn get_category_stats(
             return internal(
                 e,
                 format!(
-                    "E028: Failed to get {} for category {}",
+                    "E028: Failed to get {} for {} {}",
                     Entry::specifier_plural(),
+                    Category::specifier(),
                     &path_name
                 ),
             );
@@ -633,8 +545,9 @@ pub async fn get_category_stats(
             return internal(
                 e,
                 format!(
-                    "E027: Failed to get {} for category {}",
+                    "E027: Failed to get {} for {} {}",
                     Entry::specifier_plural(),
+                    Category::specifier(),
                     &path_name
                 ),
             );
@@ -681,22 +594,18 @@ pub async fn get_currency_stats(
     let fetched = match Currency::get_by_name_and_user(&path_name, &user, app_state.clone()).await {
         Ok(f) => f,
         Err(e) => {
-            if matches!(e, diesel::result::Error::NotFound) {
-                return HttpResponse::NotFound()
-                    .body(format!("{} not found", Currency::specifier()));
+            return if matches!(e, diesel::result::Error::NotFound) {
+                HttpResponse::NotFound().body(format!("{} not found", Currency::specifier()))
             } else {
-                return internal(
-                    e,
-                    format!("E022: Failed to get {} by name", Currency::specifier()),
-                );
-            }
+                internal(e, format!("E022: Failed to get {} by name", Currency::specifier()))
+            };
         }
     };
-    use crate::schema::entries::dsl::*;
+    use model::schema::entries::dsl::*;
     let start_of_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
-        .expect("Every month should have a start");
+        .expect("X011: Every month should have a start");
     let year_ago = chrono::NaiveDate::from_ymd_opt(now.year() - 1, now.month(), 1)
-        .expect("Every month should have a start");
+        .expect("X011: Every month should have a start");
     let found: Vec<Entry> = match entries
         .filter(
             currency_id
@@ -713,8 +622,9 @@ pub async fn get_currency_stats(
             return internal(
                 e,
                 format!(
-                    "E027: Failed to get {} for category {}",
+                    "E027: Failed to get {} for {} {}",
                     Entry::specifier_plural(),
+                    Currency::specifier(),
                     &path_name
                 ),
             );
@@ -725,9 +635,9 @@ pub async fn get_currency_stats(
     let chunked_by_month =
         found.iter().chunk_by(|item| (12u32 + item.date.month() - now.month()) % 12);
     let mut month_breakdown = vec![Decimal::ZERO; 12];
-    chunked_by_month.into_iter().for_each(|(month, g)| {
-        month_breakdown[month as usize] = g.map(|e| &e.amount).sum()
-    });
+    chunked_by_month
+        .into_iter()
+        .for_each(|(month, g)| month_breakdown[month as usize] = g.map(|e| &e.amount).sum());
 
     let found: Vec<Entry> = match entries
         .filter(
@@ -742,8 +652,9 @@ pub async fn get_currency_stats(
             return internal(
                 e,
                 format!(
-                    "E028: Failed to get {} for category {}",
+                    "E028: Failed to get {} for {} {}",
                     Entry::specifier_plural(),
+                    Currency::specifier(),
                     &path_name
                 ),
             );
@@ -763,8 +674,9 @@ pub async fn get_currency_stats(
             return internal(
                 e,
                 format!(
-                    "E027: Failed to get {} for category {}",
+                    "E027: Failed to get {} for {} {}",
                     Entry::specifier_plural(),
+                    Currency::specifier(),
                     &path_name
                 ),
             );
@@ -873,7 +785,7 @@ async fn update_entry_sources(
             source_id: entry.secondary_source_id,
         });
     }
-    use crate::schema::sources::dsl::*;
+    use model::schema::sources::dsl::*;
 
     match diesel::update(&source)
         .set(amount.eq(Numeric::from(source.amount + c1 * c2 * entry.source_amount)))
@@ -921,7 +833,7 @@ pub async fn delete_entries(
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
-    use crate::schema::entries::dsl::*;
+    use model::schema::entries::dsl::*;
 
     let user = &user.into_inner();
     let app_state = app_state.into_inner();
@@ -995,7 +907,7 @@ pub async fn archive_entries(
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
-    use crate::schema::entries::dsl::*;
+    use model::schema::entries::dsl::*;
     let updated_count =
         diesel::update(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&req.ids)))
             .set(archived.eq(true))
@@ -1015,7 +927,7 @@ macro_rules! update_handler {
             data: web::Json<$req>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
-            use crate::schema::$tb_name::dsl::*;
+            use model::schema::$tb_name::dsl::*;
             let user = user.into_inner();
             let app_state = app_state.into_inner();
             let path_name = path_name.into_inner();
@@ -1052,7 +964,7 @@ pub async fn update_entry(
     data: web::Json<UpdateEntryRequest>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
-    use crate::schema::entries::dsl::*;
+    use model::schema::entries::dsl::*;
     let user = user.into_inner();
     let app_state = app_state.into_inner();
     let data = data.into_inner();
@@ -1078,7 +990,7 @@ macro_rules! archive_handler {
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
-            use crate::schema::$tb_name::dsl::*;
+            use model::schema::$tb_name::dsl::*;
             let user = user.into_inner();
             let app_state = app_state.into_inner();
             let path_name = path_name.into_inner();
@@ -1151,13 +1063,13 @@ macro_rules! get_entries_for {
             app_state: web::Data<AppState>,
             user: web::ReqData<User>,
         ) -> HttpResponse {
-            use crate::schema::entries::dsl::archived;
+            use model::schema::entries::dsl::archived;
             let app_state = app_state.into_inner();
             let user = user.into_inner();
             let path_name = path_name.into_inner();
 
             let parent = match $ent::belonging_to(&user)
-                .filter(crate::schema::$parent_table::dsl::name.eq(&path_name))
+                .filter(model::schema::$parent_table::dsl::name.eq(&path_name))
                 .first::<$ent>(&mut app_state.cpool().await)
                 .await
             {
@@ -1206,11 +1118,11 @@ macro_rules! get_entries_for {
 }
 
 get_entries_for!(get_currency_entries, currencies, Currency, |input_id| {
-    crate::schema::entries::dsl::currency_id.eq(input_id)
+    model::schema::entries::dsl::currency_id.eq(input_id)
 },);
 
 get_entries_for!(get_category_entries, categories, Category, |input_id| {
-    crate::schema::entries::dsl::category_id.eq(input_id)
+    model::schema::entries::dsl::category_id.eq(input_id)
 },);
 
 pub async fn get_currency_sources(
@@ -1224,7 +1136,7 @@ pub async fn get_currency_sources(
     let path_name = path_name.into_inner();
 
     let parent = match Currency::belonging_to(&user)
-        .filter(crate::schema::currencies::dsl::name.eq(&path_name))
+        .filter(model::schema::currencies::dsl::name.eq(&path_name))
         .first::<Currency>(&mut app_state.cpool().await)
         .await
     {
@@ -1244,7 +1156,7 @@ pub async fn get_currency_sources(
 
     // Boxing the query allows us to mutate it without changing its type.
     let mut query = diesel::QueryDsl::into_boxed(
-        Source::belonging_to(&user).filter(crate::schema::sources::dsl::currency_id.eq(parent.id)),
+        Source::belonging_to(&user).filter(model::schema::sources::dsl::currency_id.eq(parent.id)),
     );
     if let Some(page) = req.page {
         query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
@@ -1277,13 +1189,13 @@ pub async fn get_source_entries(
     app_state: web::Data<AppState>,
     user: web::ReqData<User>,
 ) -> HttpResponse {
-    use crate::schema::entries::dsl::archived;
+    use model::schema::entries::dsl::archived;
     let app_state = app_state.into_inner();
     let user = user.into_inner();
     let path_name = path_name.into_inner();
 
     let parent = match Source::belonging_to(&user)
-        .filter(crate::schema::sources::dsl::name.eq(&path_name))
+        .filter(model::schema::sources::dsl::name.eq(&path_name))
         .first::<Source>(&mut app_state.cpool().await)
         .await
     {
@@ -1307,12 +1219,12 @@ pub async fn get_source_entries(
     if let Some(primary_only) = req.primary_only
         && primary_only
     {
-        query = query.filter(crate::schema::entries::dsl::source_id.eq(parent.id));
+        query = query.filter(model::schema::entries::dsl::source_id.eq(parent.id));
     } else {
         query = query.filter(
-            crate::schema::entries::dsl::source_id
+            model::schema::entries::dsl::source_id
                 .eq(parent.id)
-                .or(crate::schema::entries::dsl::secondary_source_id.eq(Some(parent.id))),
+                .or(model::schema::entries::dsl::secondary_source_id.eq(Some(parent.id))),
         );
     }
     query = query.filter(archived.eq(false));

@@ -1,26 +1,23 @@
-workspace = { members = ["inner_macros"] }
+# cargo run -p money-rs --features create_user
+# workspace = { members = ["inner_macros", "frontend", "model"] }
 
 [package]
 name = "money-rs"
 version = "0.1.0"
 edition = "2024"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+publish = false
 
 [dependencies]
-diesel = { version = "2.2.12", features = ["postgres", "r2d2", "chrono"] }
-diesel-derive-enum = { version = "2.1.0", features = ["postgres"] }
-dotenv = "0.15"
+model = { path = "./model", features = ["backend"] }
+
+diesel = { version = "2.3.2", features = ["postgres", "r2d2", "chrono"] }
+dotenv = "0.15.0"
 chrono = { version = "0.4.41", features = ["serde"] }
-jsonwebtoken = "9.3.1"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.142"
-r2d2 = "0.8.10"
-reqwest = "0.12.22"
+jsonwebtoken = { version = "9.3.1" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 password-hash = "0.6.0-rc.1"
 pbkdf2 = { version = "0.13.0-rc.0", features = ["simple"] }
-rust-crypto = "0.2.36"
-
 futures = { version = "0.3.31", features = ["executor"] }
 tokio = { version = "1.47.1" }
 actix-http = "3.11.0"
@@ -29,19 +26,29 @@ actix-web-httpauth = "0.8.2"
 actix-utils = "3.0.1"
 rand = "0.9.2"
 base64 = "0.22.1"
-inner-macros = { path = "./inner_macros" }
 env_logger = "0.11.8"
 # for env_logger
-log = "0.4.27"
+log = "0.4.28"
 serde_qs = "1.0.0-rc.3"
-thiserror = "2.0.12"
+thiserror = "2.0.17"
 itertools = "0.14.0"
-approx = { package = "approxim", version = "0.6.1" }
-diesel-async = { version = "0.6.1", features = ["postgres", "pool", "deadpool"] }
-async-trait = "0.1.88"
+diesel-async = { version = "0.7.3", features = ["postgres", "pool", "deadpool"] }
 fpdec = { version = "0.11.0", features = ["std", "serde-as-str", "num-traits"]}
-byteorder = { version ="1.5.0", features = ["i128"] }
-# moneta = { version = "0.5.1", features = ["std", "serde"] }
+async-trait = "0.1.89"
+# to serve front end
+actix-files = "0.6.8"
+
+#r2d2 = "0.8.10"
+#reqwest = "0.12.22"
+#rust-crypto = "0.2.36"
+#moneta = { version = "0.5.0", features = ["std", "serde"] }
+# error[E0277]: the trait bound `Rfc7519Claims: Clone` is not satisfied
+#   --> src/authentication.rs:44:28
+#    |
+# 44 |     jsonwebtoken::decode::<Rfc7519Claims>(
+#    |                            ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `Rfc7519Claims`
+#    |
+# jsonwebtoken = { version = "10.0.0", features = ["rust_crypto"] }
 
 [features]
 default = []

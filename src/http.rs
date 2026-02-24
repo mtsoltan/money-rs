@@ -4,7 +4,6 @@ use std::{fmt, ops};
 
 use actix_http::{Payload, StatusCode};
 use actix_web::{Error, FromRequest, HttpRequest, HttpResponse, ResponseError};
-use log::error;
 use serde::de::DeserializeOwned;
 
 #[derive(thiserror::Error, Debug)]

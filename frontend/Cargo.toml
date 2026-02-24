@@ -1,0 +1,41 @@
+# trunk build --release OR trunk serve
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+model = { path = "../model", default-features = false }
+
+# yew = { version = "0.21.0", features = ["csr"] }
+# yew-router = "0.18.0"
+gloo-net = "0.6.0"
+gloo-storage = "0.3.0"
+gloo-utils = "0.2.0"
+gloo-history = {  version = "0.2.2", features = ["query"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde-wasm-bindgen = "0.6.5"
+serde_qs = "1.0.0-rc.3"
+chrono = { version = "0.4.44", features = ["serde"] }
+fpdec = { version = "0.14.0", features = ["std", "serde-as-str", "num-traits"] }
+wasm-bindgen = "0.2.111"
+wasm-bindgen-futures = "0.4.54"
+wasm-logger = "0.2.0"
+thiserror = "2.0.18"
+console_error_panic_hook = "0.1.7"
+log = "0.4.29"
+html-escape = "0.2.13"
+html-to-string-macro = "0.2.5"
+
+serde_json = "1.0.149"
+getrandom = { version = "0.4.1", features = ["wasm_js"] }
+
+web-sys = { version = "0.3.81", features = [
+    "DomTokenList", "HtmlDivElement", "HtmlButtonElement", "HtmlSelectElement", "HtmlInputElement", "SubmitEvent", "MouseEvent",
+    "HtmlTableSectionElement", "HtmlTableElement", "Window", "Location", "HtmlFormElement", "DomParser",
+] }

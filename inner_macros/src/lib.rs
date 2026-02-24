@@ -4,7 +4,7 @@ use proc_macro2::{Ident, Span};
 use proc_macro2_diagnostics::{Diagnostic, Level};
 use quote::quote;
 use syn::spanned::Spanned;
-use syn::{DeriveInput, Expr, Type, parse_quote, parse2};
+use syn::{DeriveInput, Expr, Type, parse_quote, parse2, GenericArgument, PathArguments};
 
 fn is_option_type(ty: &Type) -> bool {
     if let Type::Path(path) = ty {
@@ -28,7 +28,17 @@ fn is_numeric_type(ty: &Type) -> bool {
     if let Type::Path(path) = ty {
         // Check if the type is an Option
         for segment in &path.path.segments {
-            return segment.ident.to_string() == "Numeric";
+            return segment.ident.to_string() == "Numeric" || {
+                let mut rv = false;
+                if let PathArguments::AngleBracketed(generic) = &segment.arguments {
+                    for arg in &generic.args {
+                        if let GenericArgument::Type(t) = arg {
+                            rv = rv || is_numeric_type(t);
+                        }
+                    }
+                }
+                rv
+            };
         }
     }
     false
@@ -140,6 +150,8 @@ fn entity_macro_internal(
     let ast = parse2::<DeriveInput>(input)?;
 
     let struct_name = &ast.ident;
+
+    #[cfg(feature = "backend")]
     let table_name_vec = &ast
         .attrs
         .iter()
@@ -166,6 +178,7 @@ fn entity_macro_internal(
             }
         })
         .collect::<Vec<_>>();
+    #[cfg(feature = "backend")]
     let table_name = match table_name_vec.first() {
         Some(t) => t,
         None => {
@@ -175,6 +188,11 @@ fn entity_macro_internal(
             ));
         }
     };
+    #[cfg(feature = "backend")]
+    let new_struct_name = Ident::new(format!("New{struct_name}").as_str(), Span::call_site());
+    #[cfg(feature = "backend")]
+    let update_struct_name = Ident::new(format!("Update{struct_name}").as_str(), Span::call_site());
+
     let deny_unknown_vec = &ast
         .attrs
         .iter()
@@ -207,10 +225,10 @@ fn entity_macro_internal(
     } else {
         quote! {}
     };
-    let new_struct_name = Ident::new(format!("New{struct_name}").as_str(), Span::call_site());
+
     let create_request_struct_name =
         Ident::new(format!("Create{struct_name}Request").as_str(), Span::call_site());
-    let update_struct_name = Ident::new(format!("Update{struct_name}").as_str(), Span::call_site());
+
     let update_request_struct_name =
         Ident::new(format!("Update{struct_name}Request").as_str(), Span::call_site());
     let response_struct_name =
@@ -240,7 +258,7 @@ fn entity_macro_internal(
                             match meta
                                 .path
                                 .get_ident()
-                                .expect("All metas inside entity should be single path")
+                                .expect("X001: All metas inside entity should be single path")
                                 .to_string()
                                 .as_str()
                             {
@@ -385,7 +403,9 @@ fn entity_macro_internal(
         }
     }
 
-    let expanded = quote! {
+    #[cfg(feature = "backend")]
+    let backend = quote! {
+        #[cfg(feature = "backend")]
         #[derive(diesel::Insertable)]
         #[diesel(table_name = #table_name)]
         #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -393,17 +413,25 @@ fn entity_macro_internal(
             #(#new_fields,)*
         }
 
-        #[derive(Debug, Serialize, Deserialize)]
-        #deny_unknown
-        pub struct #create_request_struct_name {
-            #(#create_request_fields,)*
-        }
-
+        #[cfg(feature = "backend")]
         #[derive(diesel::AsChangeset)]
         #[diesel(table_name = #table_name)]
         #[diesel(check_for_backend(diesel::pg::Pg))]
         pub struct #update_struct_name {
             #(#update_fields,)*
+        }
+    };
+
+    #[cfg(not(feature = "backend"))]
+    let backend =  quote! {};
+
+    let expanded = quote! {
+        #backend
+
+        #[derive(Debug, Serialize, Deserialize)]
+        #deny_unknown
+        pub struct #create_request_struct_name {
+            #(#create_request_fields,)*
         }
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -412,7 +440,7 @@ fn entity_macro_internal(
             #(#update_request_fields,)*
         }
 
-        #[derive(Debug, Serialize, Deserialize)]
+        #[derive(Debug, Serialize, Deserialize, Clone)]
         pub struct #response_struct_name {
             #(#response_fields,)*
         }

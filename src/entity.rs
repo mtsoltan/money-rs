@@ -3,34 +3,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use diesel::{
-    Associations, BelongingToDsl, BoolExpressionMethods, ExpressionMethods, Identifiable,
-    Insertable, PgTextExpressionMethods, QueryDsl, Queryable, Selectable,
-};
-use futures::future::join_all;
-use log::warn;
-use serde::{Deserialize, Serialize};
-
-// Needed by macros, keep even if "unused"
-#[rustfmt::skip]
-use {
-    fpdec::Decimal, // inner_macros relies on this type
-    crate::schema::*,
-    crate::schema::sql_types::EntryT, // Used by `diesel_derive_enum::DbEnum`
-    crate::AppState,
-    crate::numeric::Numeric, // inner_macros relies on this type
-    inner_macros::Entity // The `inner_macros::Entity` derivable macro itself
+    BelongingToDsl, BoolExpressionMethods, ExpressionMethods, PgTextExpressionMethods, QueryDsl,
 };
 use diesel_async::RunQueryDsl as _;
+use futures::future::join_all;
+use log::warn;
 
-#[derive(Debug, PartialEq, Clone, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
-#[ExistingTypePath = "EntryT"]
-pub enum EntryType {
-    Spend,
-    Income,
-    Lend,
-    Borrow,
-    Convert,
-}
+use crate::AppState;
+
+#[rustfmt::skip]
+use {
+    model::entity::*, // Entities like User and Currency
+    model::numeric::Numeric, // inner_macros relies on this type
+    fpdec::Decimal, // inner_macros relies on this type
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum StatefulTryFromError {
@@ -104,7 +90,7 @@ impl GetNetAmount for Currency {
         &self,
         app_state: Arc<AppState>,
     ) -> Result<Decimal, diesel::result::Error> {
-        use crate::schema::sources::dsl::*;
+        use model::schema::sources::dsl::*;
         let entry_amount_sum = Source::belonging_to(&self)
             .filter(archived.eq(false))
             .select(amount)
@@ -133,8 +119,7 @@ impl GetNetAmount for Category {
         app_state: Arc<AppState>,
     ) -> Result<Decimal, diesel::result::Error> {
         use diesel::dsl::sum;
-
-        use crate::schema::entries::dsl::*;
+        use model::schema::entries::dsl::*;
         let entry_amount_sum = Entry::belonging_to(&self)
             .filter(archived.eq(false))
             .select(sum(amount))
@@ -162,7 +147,7 @@ macro_rules! get_impls {
             where
                 T: 'async_trait,
             {
-                use crate::schema::$tb_name::dsl::*;
+                use model::schema::$tb_name::dsl::*;
                 $tb_name
                     .filter(name.eq(p_name.into()).and(user_id.eq(user.id)))
                     .select(id)
@@ -187,7 +172,7 @@ macro_rules! get_impls {
                 Ok(match p_name {
                     None => None,
                     Some(c) => {
-                        use crate::schema::$tb_name::dsl::*;
+                        use model::schema::$tb_name::dsl::*;
                         Some(
                             $tb_name
                                 .filter(name.eq(c.into()).and(user_id.eq(user.id)))
@@ -213,7 +198,7 @@ macro_rules! get_impls {
             where
                 T: 'async_trait,
             {
-                use crate::schema::$tb_name::dsl::*;
+                use model::schema::$tb_name::dsl::*;
                 $tb_name
                     .filter(name.eq(p_name.into()).and(user_id.eq(user.id)))
                     .first(&mut app_state.cpool().await)
@@ -237,7 +222,7 @@ macro_rules! get_impls {
                 Ok(match p_name {
                     None => None,
                     Some(c) => {
-                        use crate::schema::$tb_name::dsl::*;
+                        use model::schema::$tb_name::dsl::*;
                         Some(
                             $tb_name
                                 .filter(name.eq(c.into()).and(user_id.eq(user.id)))
@@ -255,7 +240,7 @@ macro_rules! get_impls {
                 p_id: i32,
                 app_state: Arc<AppState>,
             ) -> Result<String, diesel::result::Error> {
-                use crate::schema::$tb_name::dsl::*;
+                use model::schema::$tb_name::dsl::*;
                 $tb_name.find(p_id).select(name).first(&mut app_state.cpool().await).await
             }
         }
@@ -269,7 +254,7 @@ macro_rules! get_impls {
                 Ok(match p_id {
                     None => None,
                     Some(c) => {
-                        use crate::schema::$tb_name::dsl::*;
+                        use model::schema::$tb_name::dsl::*;
                         Some(
                             $tb_name
                                 .find(c)
@@ -288,7 +273,7 @@ macro_rules! get_impls {
                 p_id: i32,
                 app_state: Arc<AppState>,
             ) -> Result<$type, diesel::result::Error> {
-                use crate::schema::$tb_name::dsl::*;
+                use model::schema::$tb_name::dsl::*;
                 $tb_name.find(p_id).first(&mut app_state.cpool().await).await
             }
         }
@@ -302,7 +287,7 @@ macro_rules! get_impls {
                 Ok(match p_id {
                     None => None,
                     Some(c) => {
-                        use crate::schema::$tb_name::dsl::*;
+                        use model::schema::$tb_name::dsl::*;
                         Some($tb_name.find(c).first(&mut app_state.cpool().await).await?)
                     }
                 })
@@ -321,7 +306,7 @@ impl GetById<i32, Entry> for Entry {
         p_id: i32,
         app_state: Arc<AppState>,
     ) -> Result<Entry, diesel::result::Error> {
-        use crate::schema::entries::dsl::*;
+        use model::schema::entries::dsl::*;
         entries.find(p_id).first(&mut app_state.cpool().await).await
     }
 }
@@ -336,45 +321,6 @@ pub trait StatefulTryFrom<S> {
     where
         S: Send,
         Self: Sized;
-}
-
-#[derive(Debug, Queryable, Selectable, Identifiable, Clone)]
-#[diesel(table_name = users)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct User {
-    pub id: i32,
-    pub username: String,
-    pub password: String,
-    pub fixed_currency_id: Option<i32>,
-    pub enabled: bool,
-}
-
-#[derive(Insertable)]
-#[diesel(table_name = users)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct NewUser {
-    pub username: String,
-    pub password: String,
-}
-
-#[derive(
-    Entity, Debug, Queryable, Selectable, Identifiable, Associations, Insertable, Serialize,
-)]
-#[diesel(table_name = currencies)]
-#[diesel(belongs_to(User))]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-#[serde(deny_unknown_fields)]
-pub struct Currency {
-    #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, Id)]
-    pub id: i32,
-    #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub user_id: i32,
-    pub name: String,
-    /// This is the amount of fixed currency that fits within 1 this currency that fits within.
-    /// For example, the JPY rate_to_fixed would be 0.00667 if the USD is fixed.
-    pub rate_to_fixed: Numeric,
-    #[entity(HasDefault, NotInCreateRequest)]
-    pub archived: bool,
 }
 
 #[async_trait]
@@ -423,28 +369,6 @@ impl StatefulTryFrom<Currency> for CurrencyResponse {
     }
 }
 
-#[derive(
-    Entity, Debug, Queryable, Selectable, Identifiable, Associations, Insertable, Serialize,
-)]
-#[diesel(table_name = sources)]
-#[diesel(belongs_to(User))]
-#[diesel(belongs_to(Currency))]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-#[serde(deny_unknown_fields)]
-pub struct Source {
-    #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, Id)]
-    pub id: i32,
-    #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub user_id: i32,
-    pub name: String,
-    #[entity(RepresentableAsString, NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub currency_id: i32,
-    #[entity(HasDefault)]
-    pub amount: Numeric,
-    #[entity(HasDefault)]
-    pub archived: bool,
-}
-
 #[async_trait]
 impl StatefulTryFrom<CreateSourceRequest> for NewSource {
     async fn stateful_try_from(
@@ -461,7 +385,7 @@ impl StatefulTryFrom<CreateSourceRequest> for NewSource {
                 app_state.clone(),
             )
             .await?,
-            amount: value.amount,
+            amount: value.amount.map(Numeric::from),
             archived: value.archived,
         })
     }
@@ -474,7 +398,11 @@ impl StatefulTryFrom<UpdateSourceRequest> for UpdateSource {
         _user: &User,
         _app_state: Arc<AppState>,
     ) -> Result<Self, StatefulTryFromError> {
-        Ok(Self { name: value.name, amount: value.amount, archived: value.archived })
+        Ok(Self {
+            name: value.name,
+            amount: value.amount.map(Numeric::from),
+            archived: value.archived,
+        })
     }
 }
 
@@ -492,23 +420,6 @@ impl StatefulTryFrom<Source> for SourceResponse {
             archived: value.archived,
         })
     }
-}
-
-#[derive(
-    Entity, Debug, Queryable, Selectable, Identifiable, Associations, Insertable, Serialize,
-)]
-#[diesel(table_name = categories)]
-#[diesel(belongs_to(User))]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-#[serde(deny_unknown_fields)]
-pub struct Category {
-    #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, Id)]
-    pub id: i32,
-    #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub user_id: i32,
-    pub name: String,
-    #[entity(HasDefault)]
-    archived: bool,
 }
 
 #[async_trait]
@@ -542,112 +453,6 @@ impl StatefulTryFrom<Category> for CategoryResponse {
     ) -> Result<Self, StatefulTryFromError> {
         Ok(Self { name: value.name, archived: value.archived })
     }
-}
-
-#[derive(
-    Entity, Debug, Queryable, Selectable, Identifiable, Associations, Insertable, Serialize,
-)]
-#[diesel(table_name = entries)]
-#[diesel(belongs_to(User))]
-#[diesel(belongs_to(Source))]
-#[diesel(belongs_to(Category))]
-#[diesel(belongs_to(Currency))]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-#[serde(deny_unknown_fields)]
-pub struct Entry {
-    #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest, Id)]
-    pub id: i32,
-    #[entity(NotInResponse, NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub user_id: i32,
-    /// User-entered description, we can match this to previously entered descriptions and try to
-    /// decide values for other fields. In the case of multi-line descriptions, the first line of
-    /// the description is displayed and used for filtering, while the rest of the description is
-    /// kept for memory, but stored inside `long_description` displayed under ellipsis.
-    pub description: String,
-    /// If the user checks the multi-line checkbox, they can specify this. The first line of
-    /// the `long_description` is cut out and used in `description`.
-    ///
-    /// When filtering, only `description` is used. When doing full search, search tries to find in
-    /// `description` first, because it is indexed, then tries to find in `long_description` if it
-    /// fails to find in `description`.
-    pub long_description: Option<String>,
-    /// For grouping lending and borrowing. Should be set only when `entry_type` is
-    /// `EntryType::Borrow` or `EntryType::Lend`
-    pub target: Option<String>,
-    #[entity(RepresentableAsString)]
-    pub category_id: i32,
-    /// The amount input by the user, preserved as-is. The currency for this is the `currency_id`
-    /// input by the user if any, and the currency of `source_id` if no currency was input.
-    ///
-    /// Positive amounts always add to `source_id` while negative amounts always subtract from it.
-    /// When displayed, they are displayed with a color instead of a sign, and the EntryType is
-    /// used to further indicate why they have this color.
-    ///
-    /// `amount` and all other amount-based values are not updatable. If you wish to update them,
-    /// simply delete the entry and recreate it. This is to prevent confusion related to source
-    /// value changes due to possible entry currency / amount changes in update.
-    #[entity(NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub amount: Numeric,
-    /// The amount input by the user, converted to the fixed currency.
-    #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub amount_in_fixed: Numeric,
-    /// If `currency_id` is provided, we use it to denominate the amount of the entry.
-    ///
-    /// If `currency_id` is not provided for entries of any type, the `currency_id` of the source
-    /// is used.
-    #[entity(RepresentableAsString, NotInDatabaseUpdate, NotInUpdateRequest, HasCalculatedDefault)]
-    pub currency_id: i32,
-    #[entity(NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub entry_type: EntryType,
-    #[entity(RepresentableAsString, NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub source_id: i32,
-    /// Specified if `currency_id` and `source_id` are of different currencies.
-    /// Otherwise, uses the calculated default, which is the same exact amount as the specified
-    /// `amount`. Like `currency_id`, this is ignored for entries of type `EntryType::Convert`.
-    #[entity(HasCalculatedDefault, NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub source_amount: Numeric,
-    /// Only for entry_type of `EntryType::Convert`, as it converts money from one currency to
-    /// another, for two provided sources of different currencies. The source `from` is
-    /// `source_id`, while the source `to` is `secondary_source_id`.
-    #[entity(RepresentableAsString, NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub secondary_source_id: Option<i32>,
-    #[entity(NotInDatabaseUpdate, NotInUpdateRequest)]
-    pub secondary_source_amount: Option<Numeric>,
-    /// Conversion rates for currencies may change, so we store the conversion rate at which this
-    /// entry took place inside the entry itself, to keep track of how much it was worth at the
-    /// time. This is only present for entries of type `EntryType::Convert` or for those in which
-    /// `currency_id` is provided and is different from that of the provided `source_id`.
-    ///
-    /// This is `from_rtf / to_rtf`, so for example, the conversion rate for EGP->JPY is 3.
-    ///
-    /// It is filled using the value from currency. For the cases in which the
-    /// `currency_id` is not provided, or it is the same as the one from `source_id`, this uses the
-    /// default value of `1`, making it always-present.
-    #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub conversion_rate: Numeric,
-    /// This is fetched from the currency itself for anything but those of type `Entry::Convert`,
-    /// in which case it faithfully follows `conversion_rate` if specified, and is fetched from
-    /// `rate_to_fixed` of the primary currency if not.
-    ///
-    /// This is the conversion rate of the amount converted to fixed.
-    #[entity(NotInDatabaseUpdate, NotInUpdateRequest, NotInCreateRequest)]
-    pub conversion_rate_to_fixed: Numeric,
-    #[entity(RepresentableAsString)]
-    pub date: NaiveDateTime,
-    #[entity(
-        RepresentableAsString,
-        NotInDatabaseUpdate,
-        NotInUpdateRequest,
-        NotInCreateRequest,
-        HasDefault
-    )]
-    pub created_at: NaiveDateTime,
-    #[entity(HasDefault, NotInCreateRequest)]
-    pub archived: bool,
-}
-
-fn convert_currency<T: Into<Decimal>>(amount: T, from: &Currency, to: &Currency) -> Decimal {
-    from.rate_to_fixed / to.rate_to_fixed * amount.into()
 }
 
 #[async_trait]
@@ -795,7 +600,7 @@ impl StatefulTryFrom<CreateEntryRequest> for NewEntry {
             source_id: primary_source.id,
             source_amount: source_amount.into(),
             secondary_source_id,
-            secondary_source_amount: value.secondary_source_amount,
+            secondary_source_amount: value.secondary_source_amount.map(Numeric::from),
             archived: None,
         })
     }
@@ -851,7 +656,7 @@ impl StatefulTryFrom<Entry> for EntryResponse {
             source_amount: value.source_amount.into(),
             secondary_source: Source::get_name_by_id(value.secondary_source_id, app_state.clone())
                 .await?,
-            secondary_source_amount: value.secondary_source_amount,
+            secondary_source_amount: value.secondary_source_amount.map(Numeric::into),
             conversion_rate: value.conversion_rate.into(),
             conversion_rate_to_fixed: value.conversion_rate_to_fixed.into(),
             archived: value.archived,
@@ -859,55 +664,25 @@ impl StatefulTryFrom<Entry> for EntryResponse {
     }
 }
 
-/// - ids (IN) - for multi-select
-/// - sources (IN)
-/// - categories (IN)
-/// - currencies (IN)
-/// - currency (EQ) - takes precedence over currencies
-/// - amount (EQ - care float) - must also specify currency
-/// - min_amount (GTE)
-/// - max_amount (LTE)
-/// - min_amount_in_fixed (GTE) - does not need currency, uses fixed, compares to all entries
-/// - max_amount_in_fixed (LTE) - does not need currency, uses fixed, compares to all entries
-/// - date (EQ)
-/// - after (GTE)
-/// - before (LTE)
-/// - created_after (GTE)
-/// - created_before (LTE)
-/// - description (LIKE)
-/// - entry_types (IN)
-/// - limit (default: 500)
-#[derive(Debug, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct EntryQuery {
-    pub ids: Option<Vec<i32>>,
-    pub sources: Option<Vec<String>>,
-    pub categories: Option<Vec<String>>,
-    pub currencies: Option<Vec<String>>,
-    pub currency: Option<String>,
-    pub amount: Option<Decimal>,
-    pub min_amount: Option<Decimal>,
-    pub max_amount: Option<Decimal>,
-    pub min_amount_in_fixed: Option<Decimal>,
-    pub max_amount_in_fixed: Option<Decimal>,
-    pub date: Option<String>,
-    pub after: Option<String>,
-    pub before: Option<String>,
-    pub created_after: Option<String>,
-    pub created_before: Option<String>,
-    pub description: Option<String>,
-    pub entry_types: Option<Vec<EntryType>>,
-    pub limit: Option<i64>,
-    pub sort: Option<String>,
+fn convert_currency<T: Into<Decimal>>(amount: T, from: &Currency, to: &Currency) -> Decimal {
+    from.rate_to_fixed / to.rate_to_fixed * amount.into()
 }
 
-impl Entry {
-    pub async fn find_by_filter(
+pub trait FindByFilter {
+    async fn find_by_filter(
+        query_params: &EntryQuery,
+        user: &User,
+        app_state: Arc<AppState>,
+    ) -> Result<Vec<Entry>, StatefulTryFromError>;
+}
+
+impl FindByFilter for Entry {
+    async fn find_by_filter(
         query_params: &EntryQuery,
         user: &User,
         app_state: Arc<AppState>,
     ) -> Result<Vec<Entry>, StatefulTryFromError> {
-        use crate::schema::entries::dsl::*;
+        use model::schema::entries::dsl::*;
         // Boxing the query allows us to mutate it without changing its type.
         let mut query = entries.into_boxed();
 
@@ -1044,34 +819,4 @@ impl Entry {
 
         Ok(r_entries)
     }
-}
-
-pub trait HasSpecifier {
-    fn specifier() -> &'static str;
-    fn specifier_plural() -> &'static str;
-}
-
-impl HasSpecifier for User {
-    fn specifier() -> &'static str { "user" }
-    fn specifier_plural() -> &'static str { "users" }
-}
-
-impl HasSpecifier for Currency {
-    fn specifier() -> &'static str { "currency" }
-    fn specifier_plural() -> &'static str { "currencies" }
-}
-
-impl HasSpecifier for Category {
-    fn specifier() -> &'static str { "category" }
-    fn specifier_plural() -> &'static str { "categories" }
-}
-
-impl HasSpecifier for Entry {
-    fn specifier() -> &'static str { "entry" }
-    fn specifier_plural() -> &'static str { "entries" }
-}
-
-impl HasSpecifier for Source {
-    fn specifier() -> &'static str { "source" }
-    fn specifier_plural() -> &'static str { "sources" }
 }

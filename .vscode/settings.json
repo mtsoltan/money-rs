@@ -1,0 +1,8 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "frontend/Cargo.toml",
+    "model/Cargo.toml",
+    "inner_macros/Cargo.toml"
+  ]
+}
