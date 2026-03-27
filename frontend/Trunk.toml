@@ -1,0 +1,6 @@
+[build]
+# Output dir; Actix will serve this under /app
+dist = "dist"
+# Prefix asset URLs so the SPA works at /app/static and deep routes under it.
+public_url = "/app/static/"
+minify = "on_release"

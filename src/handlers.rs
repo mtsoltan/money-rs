@@ -1,0 +1,1301 @@
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::sync::Arc;
+
+use ::pbkdf2::Pbkdf2;
+use actix_web::{HttpRequest, HttpResponse, web};
+use diesel::query_dsl::methods::{FilterDsl, LimitDsl, OffsetDsl, OrderDsl, SelectDsl};
+use diesel::{
+    BelongingToDsl, BoolExpressionMethods, ExpressionMethods, SelectableHelper, insert_into,
+};
+use diesel_async::scoped_futures::ScopedFutureExt;
+use diesel_async::{AsyncConnection, RunQueryDsl as _};
+use fpdec::{Dec, Decimal};
+use futures::future::join_all;
+use itertools::Itertools;
+use log::error;
+#[cfg(any(test, feature = "create_user"))]
+use model::entity::CreateUserRequest;
+use model::entity::{
+    Category, CategoryResponse, CategoryStatsResponse, CountResponse, CreateCategoryRequest,
+    CreateCurrencyRequest, CreateEntryRequest, CreateResponse, CreateSourceRequest, Currency,
+    CurrencyResponse, CurrencyStatsResponse, EmptyResponse, Entry, EntryQuery, EntryResponse,
+    EntryType, FindEntriesResponse, HasSpecifier, LoginRequest, LoginResponse, NewCategory,
+    NewCurrency, NewEntry, NewSource, SimplePaginatedRequest, Source, SourceEntriesRequest,
+    SourceResponse, TimeBasedRequest, UpdateCategory, UpdateCategoryRequest, UpdateCurrency,
+    UpdateCurrencyRequest, UpdateEntry, UpdateEntryRequest, UpdateSource, UpdateSourceRequest,
+    User,
+};
+use model::numeric::Numeric;
+use password_hash::PasswordHash;
+use serde::{Deserialize, Serialize};
+
+use crate::consts::Conn;
+use crate::entity::{
+    FindByFilter, GetById, GetByNameAndUser, GetNetAmount, StatefulTryFrom, StatefulTryFromError,
+};
+use crate::env_vars::page_size;
+use crate::http::{ArrayQuery, internal};
+use crate::{AppState, consts};
+
+#[cfg(any(test, feature = "create_user"))]
+#[derive(thiserror::Error, Debug)]
+pub enum ExternalServiceError {
+    #[error("Failed to generate password hash")]
+    HashError(password_hash::Error),
+    #[error("Diesel operation resulted in an error")]
+    DieselError(#[from] diesel::result::Error),
+}
+
+#[cfg(any(test, feature = "create_user"))]
+impl From<password_hash::Error> for ExternalServiceError {
+    fn from(value: password_hash::Error) -> Self { Self::HashError(value) }
+}
+
+pub async fn login(data: web::Json<LoginRequest>, app_state: web::Data<AppState>) -> HttpResponse {
+    use model::schema::users::dsl::*;
+    let mut err = 0;
+
+    let mut items = users
+        .filter(username.eq(&data.username))
+        .load::<User>(&mut app_state.cpool().await)
+        .await
+        .unwrap_or(vec![]);
+
+    if items.is_empty() {
+        err += 1;
+    }
+
+    let user = items.pop().unwrap_or(User {
+        id: 0,
+        username: "".to_string(),
+        // Some random hash to ensure hash comparison runs even if user does not exist,
+        // preventing timing attacks.
+        password: "$pbkdf2-sha256$i=600000,l=32$XpabVnRzlUG8YOvL$/\
+                   rdEfUzDwQOBJBCfmc6P3DrbJDo13IrrY+6/O087CSI"
+            .to_string(),
+        fixed_currency_id: None,
+        enabled: true,
+    });
+    let stored_hash = match PasswordHash::new(&user.password) {
+        Ok(hash) => hash,
+        Err(e) => return internal(e, "E002: Failed to log in"),
+    };
+
+    if items.len() > 1 {
+        err += 1;
+    }
+
+    match stored_hash.verify_password(&[&Pbkdf2], &data.password) {
+        Ok(_) => {}
+        Err(_) => {
+            err += 1;
+        }
+    };
+    if err > 0 {
+        HttpResponse::Unauthorized().body("Unauthorized")
+    } else {
+        let token = crate::authentication::generate(user.id);
+        HttpResponse::Ok().json(LoginResponse { token })
+    }
+}
+
+#[cfg(any(test, feature = "create_user"))]
+pub async fn create_user(
+    mut data: web::Json<CreateUserRequest>,
+    app_state: web::Data<AppState>,
+) -> HttpResponse {
+    use base64::Engine as _;
+    use model::entity::NewUser;
+    use password_hash::Salt;
+    use rand::RngCore as _;
+    let created_user: Result<User, ExternalServiceError> = try {
+        use model::schema::currencies::dsl::*;
+        use model::schema::users::dsl::*;
+        // Salt::RECOMMENDED_LENGTH would fail because of equal signs.
+        // See https://docs.rs/password-hash/latest/src/password_hash/salt.rs.html#122
+        let mut bytes: [u8; 12] = [0; 12];
+        rand::rng().fill_bytes(&mut bytes);
+        let base64_string = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let generated_salt =
+            Salt::from_b64(base64_string.as_str()).expect("X008: Salt construction should work");
+        let hash = PasswordHash::generate(Pbkdf2, data.password.as_bytes(), generated_salt)?;
+
+        let user = insert_into(users)
+            .values(NewUser { password: hash.to_string(), username: data.username.to_string() })
+            .get_result::<User>(&mut app_state.cpool().await)
+            .await?;
+        insert_into(currencies)
+            .values(NewCurrency {
+                user_id: user.id,
+                name: std::mem::take(&mut data.currency),
+                // IEEE-754 float64 multiplication by 1 is always exact.
+                rate_to_fixed: Numeric::from(Dec!(1.0)),
+                archived: None,
+            })
+            .execute(&mut app_state.cpool().await)
+            .await?;
+
+        user
+    };
+
+    match created_user {
+        Ok(u) => HttpResponse::Ok().json(CreateResponse { id: u.id }),
+        Err(ExternalServiceError::DieselError(e)) => internal(e, "User already exists"),
+        Err(ExternalServiceError::HashError(e)) => internal(e, "E001: Failed to create entities"),
+    }
+}
+
+#[cfg(any(test, feature = "create_user"))]
+pub async fn delete_user(
+    path_username: web::Path<String>,
+    app_state: web::Data<AppState>,
+) -> HttpResponse {
+    use model::schema::users::dsl::*;
+    let path_username = path_username.into_inner();
+    let deleted_count = diesel::delete(users.filter(username.eq(path_username)))
+        .execute(&mut app_state.cpool().await)
+        .await;
+
+    match deleted_count {
+        Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
+        Ok(0) => HttpResponse::NotFound().finish(),
+        Ok(2..) => internal("No underlying error", "E009: Deleted more than one user"),
+        Err(e) => internal(e, "E008: Failed to delete user"),
+    }
+}
+
+impl From<StatefulTryFromError> for HttpResponse {
+    fn from(error: StatefulTryFromError) -> HttpResponse {
+        match error {
+            StatefulTryFromError::LogicInternalError(_) => internal(error, "LogicInternalError"),
+            _ => HttpResponse::BadRequest().body(error.to_string()),
+        }
+    }
+}
+
+macro_rules! create_handler {
+    ($fn_name:ident, $tb_name:ident, $req:ty, $new:ident, $ent:ty) => {
+        pub async fn $fn_name(
+            _req: HttpRequest,
+            data: web::Json<$req>,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            use model::schema::$tb_name::dsl::*;
+            let creatable = <$new as StatefulTryFrom<$req>>::stateful_try_from(
+                data.into_inner(),
+                &user.into_inner(),
+                app_state.clone().into_inner(),
+            )
+            .await;
+            let creatable = match creatable {
+                Err(e) => return HttpResponse::from(e),
+                Ok(c) => c,
+            };
+            let created = insert_into($tb_name)
+                .values(creatable)
+                .get_result::<$ent>(&mut app_state.cpool().await)
+                .await;
+            match created {
+                Ok(c) => HttpResponse::Ok().json(CreateResponse { id: c.id }),
+                Err(e) => {
+                    if matches!(
+                        e,
+                        diesel::result::Error::DatabaseError(
+                            diesel::result::DatabaseErrorKind::UniqueViolation,
+                            _
+                        )
+                    ) {
+                        HttpResponse::BadRequest()
+                            .body(format!("{} already exists", <$ent>::specifier()))
+                    } else {
+                        internal(e, format!("E014: Failed to create {}", <$ent>::specifier()))
+                    }
+                }
+            }
+        }
+    };
+}
+
+create_handler!(create_currency, currencies, CreateCurrencyRequest, NewCurrency, Currency);
+create_handler!(create_source, sources, CreateSourceRequest, NewSource, Source);
+create_handler!(create_category, categories, CreateCategoryRequest, NewCategory, Category);
+
+pub async fn create_entry(
+    _req: HttpRequest,
+    data: web::Json<CreateEntryRequest>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use model::schema::entries::dsl;
+    let app_state = app_state.into_inner();
+    let creatable = <NewEntry as StatefulTryFrom<CreateEntryRequest>>::stateful_try_from(
+        data.into_inner(),
+        &user.into_inner(),
+        app_state.clone(),
+    )
+    .await;
+    let creatable = match creatable {
+        Err(e) => return HttpResponse::from(e),
+        Ok(c) => c,
+    };
+
+    let conn = &mut app_state.cpool().await;
+
+    enum TransactionError {
+        // BadRequest gives a static error message that overlooks the underlying error due to
+        // check
+        #[allow(dead_code)]
+        BadRequestAlreadyExists(diesel::result::Error),
+        InternalE014(diesel::result::Error),
+        InternalE018(UpdateEntrySourcesError, String),
+        TransactionError(diesel::result::Error),
+    }
+
+    impl From<diesel::result::Error> for TransactionError {
+        fn from(value: diesel::result::Error) -> Self { TransactionError::TransactionError(value) }
+    }
+
+    match conn
+        .transaction(|tx| {
+            async move {
+                let created =
+                    insert_into(dsl::entries).values(creatable).get_result::<Entry>(tx).await;
+
+                let created = match created {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return if matches!(
+                            e,
+                            diesel::result::Error::DatabaseError(
+                                diesel::result::DatabaseErrorKind::UniqueViolation,
+                                _
+                            )
+                        ) {
+                            Err(TransactionError::BadRequestAlreadyExists(e))
+                        } else {
+                            Err(TransactionError::InternalE014(e))
+                        };
+                    }
+                };
+                let source_result = update_entry_sources(
+                    &created,
+                    app_state.clone(),
+                    tx,
+                    UpdateEntrySourcesType::Create,
+                )
+                .await;
+                match source_result {
+                    Err(e) => {
+                        let (eid, sid) = match e {
+                            UpdateEntrySourcesError::NoSource { entry_id, source_id, .. } => {
+                                (entry_id, source_id)
+                            }
+                            UpdateEntrySourcesError::MalformedEntry { entry_id, source_id } => {
+                                (entry_id, source_id)
+                            }
+                            UpdateEntrySourcesError::UpdateError {
+                                entry_id, source_id, ..
+                            } => (entry_id, source_id),
+                        };
+                        let error_string = format!(
+                            "E018: Successfully created {} {}, but failed to get {} {:?} for it",
+                            Entry::specifier(),
+                            eid,
+                            Source::specifier(),
+                            sid,
+                        );
+                        Err(TransactionError::InternalE018(e, error_string))
+                    }
+                    Ok(_) => Ok(CreateResponse { id: created.id }),
+                }
+            }
+            .scope_boxed()
+        })
+        .await
+    {
+        Err(e) => match e {
+            TransactionError::BadRequestAlreadyExists(_) => {
+                HttpResponse::BadRequest().body(format!("{} already exists", Entry::specifier()))
+            }
+            TransactionError::InternalE014(e) => {
+                internal(e, format!("E014: Failed to create {}", Entry::specifier()))
+            }
+            TransactionError::InternalE018(e, error_string) => internal(e, error_string),
+            TransactionError::TransactionError(e) => {
+                internal(e, "E019: Internal transaction error")
+            }
+        },
+        Ok(e) => HttpResponse::Ok().json(e),
+    }
+}
+
+macro_rules! get_all_handler {
+    ($fn_name:ident, $ent:ident, $resp:ident, $order:expr) => {
+        pub async fn $fn_name(
+            web::Query(req): web::Query<SimplePaginatedRequest>,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            let user = user.into_inner();
+            let app_state = app_state.into_inner();
+
+            // Boxing the query allows us to mutate it without changing its type.
+            let mut query = diesel::QueryDsl::into_boxed(
+                $ent::belonging_to(&user).select($ent::as_select()).order($order),
+            );
+            if let Some(page) = req.page {
+                query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
+            }
+            let fetched = match query.load(&mut app_state.cpool().await).await {
+                Err(e) => {
+                    return internal(
+                        e,
+                        format!("E003: Failed to get all {}", $ent::specifier_plural()),
+                    )
+                }
+                Ok(f) => f,
+            };
+            let responses = join_all(
+                fetched
+                    .into_iter()
+                    .map(async |f| $resp::stateful_try_from(f, &user, app_state.clone()).await),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<$resp>, _>>();
+
+            match responses {
+                Err(e) => HttpResponse::from(e),
+                Ok(c) => HttpResponse::Ok().json(c),
+            }
+        }
+    };
+}
+
+get_all_handler!(
+    get_currencies,
+    Currency,
+    CurrencyResponse,
+    model::schema::currencies::dsl::id.asc()
+);
+get_all_handler!(get_sources, Source, SourceResponse, model::schema::sources::dsl::name.asc());
+get_all_handler!(
+    get_categories,
+    Category,
+    CategoryResponse,
+    model::schema::categories::dsl::name.asc()
+);
+get_all_handler!(
+    get_entries,
+    Entry,
+    EntryResponse,
+    (
+        model::schema::entries::dsl::date.asc(),
+        model::schema::entries::dsl::created_at.asc(),
+        model::schema::entries::dsl::id.asc()
+    )
+);
+
+#[allow(dead_code)]
+pub async fn unimplemented(
+    _app_state: web::Data<AppState>,
+    _user: web::ReqData<User>,
+) -> HttpResponse {
+    HttpResponse::NotImplemented().body("Unimplemented.".to_string())
+}
+
+macro_rules! get_by_name_handler {
+    ($fn_name:ident, $tb_name:ident, $ent:ident, $resp:ident) => {
+        pub async fn $fn_name(
+            path_name: web::Path<String>,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            let user = user.into_inner();
+            let app_state = app_state.into_inner();
+            let path_name = path_name.into_inner();
+            let fetched =
+                match $ent::get_by_name_and_user(path_name, &user, app_state.clone()).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if matches!(e, diesel::result::Error::NotFound) {
+                            return HttpResponse::NotFound()
+                                .body(format!("{} not found", $ent::specifier()));
+                        } else {
+                            return internal(
+                                e,
+                                format!("E015: Failed to get {} by name", <$ent>::specifier()),
+                            );
+                        }
+                    }
+                };
+            let response = $resp::stateful_try_from(fetched, &user, app_state.clone()).await;
+            match response {
+                Err(e) => HttpResponse::from(e),
+                Ok(entity) => HttpResponse::Ok().json(entity),
+            }
+        }
+    };
+}
+
+get_by_name_handler!(get_currency_by_name, currencies, Currency, CurrencyResponse);
+get_by_name_handler!(get_source_by_name, sources, Source, SourceResponse);
+get_by_name_handler!(get_category_by_name, categories, Category, CategoryResponse);
+
+pub async fn get_category_stats(
+    web::Query(req): web::Query<TimeBasedRequest>,
+    path_name: web::Path<String>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use chrono::Datelike;
+    let now = if let Some(req_now) = req.now
+        && let Ok(req_now) = chrono::NaiveDate::parse_from_str(req_now.as_str(), "%Y-%m-%d")
+    {
+        req_now
+    } else {
+        chrono::Utc::now().date_naive()
+    };
+
+    let user = user.into_inner();
+    let app_state = app_state.into_inner();
+    let path_name = path_name.into_inner();
+    let fetched = match Category::get_by_name_and_user(&path_name, &user, app_state.clone()).await {
+        Ok(f) => f,
+        Err(e) => {
+            return if matches!(e, diesel::result::Error::NotFound) {
+                HttpResponse::NotFound().body(format!("{} not found", Category::specifier()))
+            } else {
+                internal(e, format!("E022: Failed to get {} by name", Category::specifier()))
+            };
+        }
+    };
+    use model::schema::entries::dsl::*;
+    let start_of_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+        .expect("X011: Every month should have a start");
+    let year_ago = chrono::NaiveDate::from_ymd_opt(now.year() - 1, now.month(), 1)
+        .expect("X011: Every month should have a start");
+    let found: Vec<Entry> = match entries
+        .filter(
+            category_id
+                .eq(fetched.id)
+                .and(date.ge(chrono::NaiveDateTime::from(year_ago)))
+                .and(date.lt(chrono::NaiveDateTime::from(start_of_month))),
+        )
+        .order(date.asc())
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E027: Failed to get {} for {} {}",
+                    Entry::specifier_plural(),
+                    Category::specifier(),
+                    &path_name
+                ),
+            );
+        }
+    };
+    let year_sum_in_fixed: Decimal = found.iter().map(|e| &e.amount_in_fixed).sum();
+    // Order months from same-month last year to the month before this one
+    let chunked_by_month =
+        found.iter().chunk_by(|item| (12u32 + item.date.month() - now.month()) % 12);
+    let mut month_breakdown_in_fixed = vec![Decimal::ZERO; 12];
+    chunked_by_month.into_iter().for_each(|(month, g)| {
+        month_breakdown_in_fixed[month as usize] = g.map(|e| &e.amount_in_fixed).sum()
+    });
+
+    let found: Vec<Entry> = match entries
+        .filter(
+            category_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(start_of_month))),
+        )
+        .order(date.asc())
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E028: Failed to get {} for {} {}",
+                    Entry::specifier_plural(),
+                    Category::specifier(),
+                    &path_name
+                ),
+            );
+        }
+    };
+    let current_month_in_fixed: Decimal = found.iter().map(|e| &e.amount_in_fixed).sum();
+
+    let found: Vec<Entry> = match entries
+        .filter(category_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(year_ago))))
+        .order(amount_in_fixed.desc())
+        .limit(10)
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E027: Failed to get {} for {} {}",
+                    Entry::specifier_plural(),
+                    Category::specifier(),
+                    &path_name
+                ),
+            );
+        }
+    };
+
+    let year_largest_spends: Vec<EntryResponse> = join_all(
+        found
+            .into_iter()
+            .map(async |e| EntryResponse::stateful_try_from(e, &user, app_state.clone()).await),
+    )
+    .await
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
+    let response = CategoryStatsResponse {
+        year_sum_in_fixed,
+        monthly_average_in_fixed: year_sum_in_fixed / Dec!(12.0),
+        month_breakdown_in_fixed,
+        current_month_in_fixed,
+        year_largest_spends,
+    };
+    HttpResponse::Ok().json(response)
+}
+
+pub async fn get_currency_stats(
+    web::Query(req): web::Query<TimeBasedRequest>,
+    path_name: web::Path<String>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use chrono::Datelike;
+    let now = if let Some(req_now) = req.now
+        && let Ok(req_now) = chrono::NaiveDate::parse_from_str(req_now.as_str(), "%Y-%m-%d")
+    {
+        req_now
+    } else {
+        chrono::Utc::now().date_naive()
+    };
+
+    let user = user.into_inner();
+    let app_state = app_state.into_inner();
+    let path_name = path_name.into_inner();
+    let fetched = match Currency::get_by_name_and_user(&path_name, &user, app_state.clone()).await {
+        Ok(f) => f,
+        Err(e) => {
+            return if matches!(e, diesel::result::Error::NotFound) {
+                HttpResponse::NotFound().body(format!("{} not found", Currency::specifier()))
+            } else {
+                internal(e, format!("E022: Failed to get {} by name", Currency::specifier()))
+            };
+        }
+    };
+    use model::schema::entries::dsl::*;
+    let start_of_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+        .expect("X011: Every month should have a start");
+    let year_ago = chrono::NaiveDate::from_ymd_opt(now.year() - 1, now.month(), 1)
+        .expect("X011: Every month should have a start");
+    let found: Vec<Entry> = match entries
+        .filter(
+            currency_id
+                .eq(fetched.id)
+                .and(date.ge(chrono::NaiveDateTime::from(year_ago)))
+                .and(date.lt(chrono::NaiveDateTime::from(start_of_month))),
+        )
+        .order(date.asc())
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E027: Failed to get {} for {} {}",
+                    Entry::specifier_plural(),
+                    Currency::specifier(),
+                    &path_name
+                ),
+            );
+        }
+    };
+    let year_sum: Decimal = found.iter().map(|e| &e.amount).sum();
+    // Order months from same-month last year to the month before this one
+    let chunked_by_month =
+        found.iter().chunk_by(|item| (12u32 + item.date.month() - now.month()) % 12);
+    let mut month_breakdown = vec![Decimal::ZERO; 12];
+    chunked_by_month
+        .into_iter()
+        .for_each(|(month, g)| month_breakdown[month as usize] = g.map(|e| &e.amount).sum());
+
+    let found: Vec<Entry> = match entries
+        .filter(
+            currency_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(start_of_month))),
+        )
+        .order(date.asc())
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E028: Failed to get {} for {} {}",
+                    Entry::specifier_plural(),
+                    Currency::specifier(),
+                    &path_name
+                ),
+            );
+        }
+    };
+    let current_month: Decimal = found.iter().map(|e| &e.amount).sum();
+
+    let found: Vec<Entry> = match entries
+        .filter(currency_id.eq(fetched.id).and(date.ge(chrono::NaiveDateTime::from(year_ago))))
+        .order(amount_in_fixed.desc())
+        .limit(10)
+        .load::<Entry>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return internal(
+                e,
+                format!(
+                    "E027: Failed to get {} for {} {}",
+                    Entry::specifier_plural(),
+                    Currency::specifier(),
+                    &path_name
+                ),
+            );
+        }
+    };
+
+    let year_largest_spends: Vec<EntryResponse> = join_all(
+        found
+            .into_iter()
+            .map(async |e| EntryResponse::stateful_try_from(e, &user, app_state.clone()).await),
+    )
+    .await
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
+    let response = CurrencyStatsResponse {
+        year_sum,
+        monthly_average: year_sum / Dec!(12.0),
+        month_breakdown,
+        current_month,
+        year_largest_spends,
+    };
+    HttpResponse::Ok().json(response)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkRequest {
+    ids: Vec<i32>,
+}
+
+#[derive(thiserror::Error, Debug, Serialize)]
+pub enum UpdateEntrySourcesError {
+    #[error("failed to get source {source_id:?} for entry {entry_id}")]
+    NoSource {
+        entry_id: i32,
+        /// Secondary sources may be non-present. Wrap primary sources with Some() always.
+        source_id: Option<i32>,
+        #[serde(skip_serializing)]
+        #[source]
+        error: diesel::result::Error,
+    },
+    #[error("Entry {entry_id} is malformed, with source {source_id:?}")]
+    MalformedEntry { entry_id: i32, source_id: Option<i32> },
+    #[error("Failed to update source {source_id:?} for entry {entry_id}")]
+    UpdateError {
+        entry_id: i32,
+        source_id: Option<i32>,
+        #[serde(skip_serializing)]
+        #[source]
+        error: diesel::result::Error,
+    },
+}
+
+pub enum UpdateEntrySourcesType {
+    /// Adds entry values to source.
+    Create,
+    /// Subtracts entry values from source.
+    Delete,
+}
+
+/// app_state here is for read-only queries
+/// conn, be it a connection or a transcaction, is for updates
+#[allow(clippy::single_match)]
+async fn update_entry_sources(
+    entry: &Entry,
+    app_state: Arc<AppState>,
+    mut conn: &mut Conn,
+    update_type: UpdateEntrySourcesType,
+) -> Result<i32, UpdateEntrySourcesError> {
+    let c1 = match update_type {
+        UpdateEntrySourcesType::Create => Dec!(1),
+        UpdateEntrySourcesType::Delete => Dec!(-1),
+    };
+    let c2 = match entry.entry_type {
+        EntryType::Borrow => Dec!(1.0), // borrowing increases the source
+        EntryType::Lend => Dec!(-1),
+        EntryType::Income => Dec!(1), // income increases the source
+        EntryType::Spend => Dec!(-1),
+        EntryType::Convert => Dec!(-1), // convert decreases primary source
+    };
+    let source = match Source::get_by_id(entry.source_id, app_state.clone()).await {
+        Err(e) => {
+            return Err(UpdateEntrySourcesError::NoSource {
+                entry_id: entry.id,
+                source_id: Some(entry.source_id),
+                error: e,
+            });
+        }
+        Ok(s) => s,
+    };
+    let secondary_source =
+        match Source::get_by_id(entry.secondary_source_id, app_state.clone()).await {
+            Err(e) => {
+                return Err(UpdateEntrySourcesError::NoSource {
+                    entry_id: entry.id,
+                    source_id: entry.secondary_source_id,
+                    error: e,
+                });
+            }
+            Ok(s) => s,
+        };
+    if entry.entry_type != EntryType::Convert && secondary_source.is_some() {
+        return Err(UpdateEntrySourcesError::MalformedEntry {
+            entry_id: entry.id,
+            source_id: entry.secondary_source_id,
+        });
+    }
+    use model::schema::sources::dsl::*;
+
+    match diesel::update(&source)
+        .set(amount.eq(Numeric::from(source.amount + c1 * c2 * entry.source_amount)))
+        .execute(&mut conn)
+        .await
+    {
+        Err(e) => {
+            return Err(UpdateEntrySourcesError::UpdateError {
+                entry_id: entry.id,
+                source_id: Some(entry.source_id),
+                error: e,
+            });
+        }
+        Ok(_) => {}
+    };
+    if let Some(a) = entry.secondary_source_amount
+        && let Some(ss) = secondary_source
+    {
+        match diesel::update(&ss)
+            .set(amount.eq(Numeric::from(ss.amount + c1 * a)))
+            .execute(&mut conn)
+            .await
+        {
+            Err(e) => {
+                return Err(UpdateEntrySourcesError::UpdateError {
+                    entry_id: entry.id,
+                    source_id: entry.secondary_source_id,
+                    error: e,
+                });
+            }
+            Ok(_) => {}
+        };
+    }
+
+    Ok(entry.id)
+}
+
+/// Deleting returns amounts to their respective sources. Please use archive if you do not wish
+/// your entries to vanish from existence and their amounts be returned.
+///
+/// We do not use transactions between update sources and delete here, we simply update sources
+/// then delete for each entry where the update was successful, ignoring the ones that weren't.
+pub async fn delete_entries(
+    ArrayQuery(req): ArrayQuery<BulkRequest>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use model::schema::entries::dsl::*;
+
+    let user = &user.into_inner();
+    let app_state = app_state.into_inner();
+
+    let fetched = match Entry::belonging_to(&user)
+        .select(Entry::as_select())
+        .filter(id.eq_any(&req.ids))
+        .load(&mut app_state.cpool().await)
+        .await
+    {
+        Err(e) => {
+            return internal(
+                e,
+                format!("E016: Failed to get {} for deletion", Entry::specifier_plural()),
+            );
+        }
+        Ok(f) => f,
+    };
+
+    let futures = fetched.iter().map(async |e| {
+        update_entry_sources(
+            e,
+            app_state.clone(),
+            &mut app_state.cpool().await,
+            UpdateEntrySourcesType::Delete,
+        )
+        .await
+    });
+    let source_map_result = join_all(futures).await;
+    let (oks, errs): (Vec<_>, Vec<_>) = source_map_result.into_iter().partition_result();
+    let deleted_count = diesel::delete(Entry::belonging_to(&user).filter(id.eq_any(oks)))
+        .execute(&mut app_state.cpool().await)
+        .await;
+
+    let errs_json = match serde_json::to_string(&errs) {
+        Err(e) => {
+            error!(
+                "Failed to serialize {} transaction errors as string {:?} with error {:?}",
+                Source::specifier(),
+                &errs,
+                e
+            );
+            format!(
+                "Failed to serialize {} transaction errors as string {:?}",
+                Source::specifier(),
+                &errs
+            )
+        }
+        Ok(o) => o,
+    };
+
+    match (deleted_count, errs.len()) {
+        (Ok(count), 0) => HttpResponse::Ok().json(CountResponse { count }),
+        (Ok(count), _) => internal(
+            errs,
+            format!(
+                "E017: Successfully deleted {} {}, but failed to get {} for {}: {}",
+                count,
+                Entry::specifier_plural(),
+                Source::specifier_plural(),
+                Entry::specifier_plural(),
+                errs_json,
+            ),
+        ),
+        (Err(e), _) => internal(e, format!("E004: Failed to delete {}", Entry::specifier_plural())),
+    }
+}
+
+pub async fn archive_entries(
+    ArrayQuery(req): ArrayQuery<BulkRequest>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use model::schema::entries::dsl::*;
+    let updated_count =
+        diesel::update(Entry::belonging_to(&user.into_inner()).filter(id.eq_any(&req.ids)))
+            .set(archived.eq(true))
+            .execute(&mut app_state.cpool().await)
+            .await;
+    match updated_count {
+        Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
+        Err(e) => internal(e, "E005: Failed to archive entities"),
+    }
+}
+
+macro_rules! update_handler {
+    ($fn_name:ident, $tb_name:ident, $ent:ident, $changeset:ident, $req:ident) => {
+        pub async fn $fn_name(
+            path_name: web::Path<String>,
+            app_state: web::Data<AppState>,
+            data: web::Json<$req>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            use model::schema::$tb_name::dsl::*;
+            let user = user.into_inner();
+            let app_state = app_state.into_inner();
+            let path_name = path_name.into_inner();
+            let data = data.into_inner();
+            let change_set =
+                match $changeset::stateful_try_from(data, &user, app_state.clone()).await {
+                    Err(e) => return HttpResponse::from(e),
+                    Ok(c) => c,
+                };
+            match diesel::update($ent::belonging_to(&user).filter(name.eq(&path_name)))
+                .set(change_set)
+                .execute(&mut app_state.cpool().await)
+                .await
+            {
+                Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
+                Ok(0) => HttpResponse::NotFound().finish(),
+                Ok(2..) => internal(
+                    "No underlying error",
+                    format!("E010: Updated more than one {}", $ent::specifier()),
+                ),
+                Err(e) => internal(e, format!("E011: Could not update {}", $ent::specifier())),
+            }
+        }
+    };
+}
+
+update_handler!(update_currency, currencies, Currency, UpdateCurrency, UpdateCurrencyRequest);
+update_handler!(update_source, sources, Source, UpdateSource, UpdateSourceRequest);
+update_handler!(update_category, categories, Category, UpdateCategory, UpdateCategoryRequest);
+
+pub async fn update_entry(
+    ArrayQuery(req): ArrayQuery<BulkRequest>,
+    app_state: web::Data<AppState>,
+    data: web::Json<UpdateEntryRequest>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use model::schema::entries::dsl::*;
+    let user = user.into_inner();
+    let app_state = app_state.into_inner();
+    let data = data.into_inner();
+    let change_set = match UpdateEntry::stateful_try_from(data, &user, app_state.clone()).await {
+        Err(e) => return HttpResponse::from(e),
+        Ok(c) => c,
+    };
+    match diesel::update(Entry::belonging_to(&user).filter(id.eq_any(req.ids)))
+        .set(change_set)
+        .execute(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(count) => HttpResponse::Ok().json(CountResponse { count }),
+        Err(e) => internal(e, format!("E011: Could not update {}", Entry::specifier())),
+    }
+}
+
+/// To un-archive, we update with `{ "archived": false }`
+macro_rules! archive_handler {
+    ($fn_name:ident, $tb_name:ident, $ent:ident, $err:expr) => {
+        pub async fn $fn_name(
+            path_name: web::Path<String>,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            use model::schema::$tb_name::dsl::*;
+            let user = user.into_inner();
+            let app_state = app_state.into_inner();
+            let path_name = path_name.into_inner();
+            let fetched = match $ent::belonging_to(&user)
+                .filter(name.eq(&path_name))
+                .first::<$ent>(&mut app_state.cpool().await)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    if matches!(e, diesel::result::Error::NotFound) {
+                        return HttpResponse::NotFound()
+                            .body(format!("{} not found", $ent::specifier()));
+                    } else {
+                        return internal(e, format!("E023: Could not fetch {}", $ent::specifier()));
+                    }
+                }
+            };
+            let net_amount = match fetched.get_net_amount(app_state.clone()).await {
+                Ok(t) => t,
+                Err(e) => return internal(e, "E006: Unable to construct sum - failed to archive"),
+            };
+            if net_amount.abs() > consts::EPSILON {
+                return HttpResponse::BadRequest().body($err);
+            }
+            match diesel::update(&fetched)
+                .set(archived.eq(true))
+                .execute(&mut app_state.cpool().await)
+                .await
+            {
+                Ok(1) => HttpResponse::Ok().json(EmptyResponse {}),
+                Ok(0) => HttpResponse::NotFound().finish(),
+                Ok(2..) => internal(
+                    "No underlying error",
+                    format!("E012: Archived more than one {}", $ent::specifier()),
+                ),
+                Err(e) => internal(e, format!("E013: Could not archive {}", $ent::specifier())),
+            }
+        }
+    };
+}
+
+archive_handler!(
+    archive_currency,
+    currencies,
+    Currency,
+    "You cannot archive that currency while you still have balance within it."
+);
+archive_handler!(
+    archive_source,
+    sources,
+    Source,
+    "You cannot archive that source while it still has balance. You can transfer all balance to \
+     another source of the same currency or do a currency conversion to a different source of a \
+     different currency. "
+);
+archive_handler!(
+    archive_category,
+    categories,
+    Category,
+    "You cannot archive that category while it has entries. You can transfer all entries to \
+     another category and then proceed."
+);
+
+macro_rules! get_entries_for {
+    ($fn_name:ident, $parent_table:ident, $ent:ident, $filter_expr:expr,) => {
+        pub async fn $fn_name(
+            web::Query(req): web::Query<SimplePaginatedRequest>,
+            path_name: web::Path<String>,
+            app_state: web::Data<AppState>,
+            user: web::ReqData<User>,
+        ) -> HttpResponse {
+            use model::schema::entries::dsl::archived;
+            let app_state = app_state.into_inner();
+            let user = user.into_inner();
+            let path_name = path_name.into_inner();
+
+            let parent = match $ent::belonging_to(&user)
+                .filter(model::schema::$parent_table::dsl::name.eq(&path_name))
+                .first::<$ent>(&mut app_state.cpool().await)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    if matches!(e, diesel::result::Error::NotFound) {
+                        return HttpResponse::NotFound().body(format!(
+                            "{} {} not found",
+                            $ent::specifier(),
+                            path_name
+                        ));
+                    } else {
+                        return internal(e, format!("E024: Could not fetch {}", $ent::specifier()));
+                    }
+                }
+            };
+
+            // Boxing the query allows us to mutate it without changing its type.
+            let mut query = diesel::QueryDsl::into_boxed(
+                Entry::belonging_to(&user).filter($filter_expr(parent.id).and(archived.eq(false))),
+            );
+            if let Some(page) = req.page {
+                query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
+            }
+            let found = query.load::<Entry>(&mut app_state.cpool().await).await;
+
+            match found {
+                Ok(entries) => {
+                    let out =
+                        join_all(entries.into_iter().map(|e| {
+                            EntryResponse::stateful_try_from(e, &user, app_state.clone())
+                        }))
+                        .await
+                        .into_iter()
+                        .filter_map(Result::ok)
+                        .collect::<Vec<_>>();
+                    HttpResponse::Ok().json(out)
+                }
+                Err(e) => internal(
+                    e,
+                    format!("E010: Failed to get entries for {} {}", $ent::specifier(), path_name),
+                ),
+            }
+        }
+    };
+}
+
+get_entries_for!(get_currency_entries, currencies, Currency, |input_id| {
+    model::schema::entries::dsl::currency_id.eq(input_id)
+},);
+
+get_entries_for!(get_category_entries, categories, Category, |input_id| {
+    model::schema::entries::dsl::category_id.eq(input_id)
+},);
+
+pub async fn get_currency_sources(
+    web::Query(req): web::Query<SimplePaginatedRequest>,
+    path_name: web::Path<String>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    let app_state = app_state.into_inner();
+    let user = user.into_inner();
+    let path_name = path_name.into_inner();
+
+    let parent = match Currency::belonging_to(&user)
+        .filter(model::schema::currencies::dsl::name.eq(&path_name))
+        .first::<Currency>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            if matches!(e, diesel::result::Error::NotFound) {
+                return HttpResponse::NotFound().body(format!(
+                    "{} {} not found",
+                    Currency::specifier(),
+                    path_name
+                ));
+            } else {
+                return internal(e, format!("E025: Could not fetch {}", Currency::specifier()));
+            }
+        }
+    };
+
+    // Boxing the query allows us to mutate it without changing its type.
+    let mut query = diesel::QueryDsl::into_boxed(
+        Source::belonging_to(&user).filter(model::schema::sources::dsl::currency_id.eq(parent.id)),
+    );
+    if let Some(page) = req.page {
+        query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
+    }
+    let found = query.load::<Source>(&mut app_state.cpool().await).await;
+
+    match found {
+        Ok(sources) => {
+            let out = join_all(
+                sources
+                    .into_iter()
+                    .map(|s| SourceResponse::stateful_try_from(s, &user, app_state.clone())),
+            )
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+            HttpResponse::Ok().json(out)
+        }
+        Err(e) => internal(
+            e,
+            format!("E021: Failed to get sources for {} {}", Currency::specifier(), path_name),
+        ),
+    }
+}
+
+pub async fn get_source_entries(
+    web::Query(req): web::Query<SourceEntriesRequest>,
+    path_name: web::Path<String>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    use model::schema::entries::dsl::archived;
+    let app_state = app_state.into_inner();
+    let user = user.into_inner();
+    let path_name = path_name.into_inner();
+
+    let parent = match Source::belonging_to(&user)
+        .filter(model::schema::sources::dsl::name.eq(&path_name))
+        .first::<Source>(&mut app_state.cpool().await)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            if matches!(e, diesel::result::Error::NotFound) {
+                return HttpResponse::NotFound().body(format!(
+                    "{} {} not found",
+                    Source::specifier(),
+                    path_name
+                ));
+            } else {
+                return internal(e, format!("E026: Could not fetch {}", Source::specifier()));
+            }
+        }
+    };
+
+    // Boxing the query allows us to mutate it without changing its type.
+    let mut query = diesel::QueryDsl::into_boxed(Entry::belonging_to(&user));
+
+    if let Some(primary_only) = req.primary_only
+        && primary_only
+    {
+        query = query.filter(model::schema::entries::dsl::source_id.eq(parent.id));
+    } else {
+        query = query.filter(
+            model::schema::entries::dsl::source_id
+                .eq(parent.id)
+                .or(model::schema::entries::dsl::secondary_source_id.eq(Some(parent.id))),
+        );
+    }
+    query = query.filter(archived.eq(false));
+    if let Some(page) = req.page {
+        query = query.limit(page_size().into()).offset((page_size() * (page - 1)).into());
+    }
+    let found = query.load::<Entry>(&mut app_state.cpool().await).await;
+
+    match found {
+        Ok(entries) => {
+            let out = join_all(
+                entries
+                    .into_iter()
+                    .map(|e| EntryResponse::stateful_try_from(e, &user, app_state.clone())),
+            )
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+            HttpResponse::Ok().json(out)
+        }
+        Err(e) => internal(
+            e,
+            format!("E020: Failed to get entries for {} {}", Source::specifier(), path_name),
+        ),
+    }
+}
+
+pub async fn find_entries(
+    ArrayQuery(query_params): ArrayQuery<EntryQuery>,
+    app_state: web::Data<AppState>,
+    user: web::ReqData<User>,
+) -> HttpResponse {
+    let user = user.into_inner();
+    let app_state = app_state.into_inner();
+
+    match Entry::find_by_filter(&query_params, &user, app_state.clone()).await {
+        Ok(entries) => {
+            let sum_amounts: Decimal = entries.iter().map(|entry| &entry.amount).sum();
+
+            let mut sum_per_month: HashMap<String, Decimal> = HashMap::new();
+            for entry in &entries {
+                let month_year = entry.date.format("%Y-%m").to_string();
+                *sum_per_month.entry(month_year).or_insert(Decimal::ZERO) += entry.amount.dec();
+            }
+            let num_months = Decimal::from(sum_per_month.len() as u64);
+            let monthly_average =
+                if num_months != 0 { sum_amounts / num_months } else { Decimal::ZERO };
+
+            let mut sum_per_category_per_month: HashMap<String, Decimal> = HashMap::new();
+            for entry in &entries {
+                let month_year = entry.date.format("%Y-%m").to_string();
+                let category_month_key =
+                    format!("{}|{}", entry.category_id.clone(), month_year.clone());
+                *sum_per_category_per_month.entry(category_month_key).or_insert(Decimal::ZERO) +=
+                    entry.amount.dec();
+            }
+
+            HttpResponse::Ok().json(FindEntriesResponse {
+                sum_per_month,
+                monthly_average,
+                sum_per_category_per_month,
+                entries: join_all(entries.into_iter().map(async |o| {
+                    EntryResponse::stateful_try_from(o, &user, app_state.clone()).await
+                }))
+                .await
+                .into_iter()
+                .filter_map(|o| o.ok())
+                .collect(),
+            })
+        }
+        Err(e) => e.into(),
+    }
+}
